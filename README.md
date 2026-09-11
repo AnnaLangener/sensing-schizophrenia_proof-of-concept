@@ -28,8 +28,6 @@ Dependencies referenced by the active workflow include:
 - **Python:** NumPy, pandas, PyTorch, SciPy, scikit-learn, Matplotlib, seaborn, and IPython/Jupyter. Model notebooks install `chronos-forecasting>=2.0`; Model 2 also installs `peft` and `torchao>=0.16.0`. `Overview_Results.ipynb` uses `itables`.
 - **R:** `rmarkdown`, `shiny`, `reticulate`, `dplyr`, `tibble`, `tidyr`, `ggplot2`, `stringr`, `purrr`, `patchwork`, `hrbrthemes`, `tidytext`, and `ggh4x` across the scripts and explorer. Reticulate needs a Python environment with PyTorch and NumPy to read prediction files.
 
-These are dependencies observed in the source, not a tested, pinned environment specification. The notebooks use Chronos-2 internal APIs, so record installed versions when reproducing a run.
-
 Before execution, update the following settings for your machine:
 
 | Component | Settings to review |
