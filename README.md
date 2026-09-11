@@ -52,7 +52,7 @@ The current main-model loops use `combined` as input. They sort samples by times
 5. **Explore and plot.** With result paths and the R/Python environment configured, run the commands below from `Code/`.
 
 
-## Outputs
+## Outputs (not uploaded on GitHub)
 
 ```text
 SensingIndividualized/
