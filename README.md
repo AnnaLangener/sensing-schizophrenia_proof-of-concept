@@ -8,18 +8,18 @@ This directory is a notebook-based research workflow. Configuration lives inside
 
 | File | Purpose |
 | --- | --- |
-| [FeatureCreation_SensingSchiophrenia.ipynb](FeatureCreation_SensingSchiophrenia.ipynb) | Cleans sensor streams, constructs EMA symptom scores, and exports participant time-series bundles. |
-| [MainModel1_Combined_Head.ipynb](MainModel1_Combined_Head.ipynb) | Model 1: frozen Chronos-2 embeddings of combined sensor inputs with a trainable prediction head. |
-| [MainModel2_LoRa_Combined_Head.ipynb](MainModel2_LoRa_Combined_Head.ipynb) | Model 2: Chronos-2 adaptation with low-rank adaptation (LoRA) and a combined-input prediction head. |
-| [LOCAL_MainModel2_LoRa_Combined_Head.ipynb](LOCAL_MainModel2_LoRa_Combined_Head.ipynb) | Local Model 2 variant; selects Apple MPS, CUDA, or CPU, in that order of availability. |
-| [MainModel3_Reg.ipynb](MainModel3_Reg.ipynb) | Model 3: Chronos-2 REG-token embeddings with a head predicting the 0.1, 0.5, and 0.9 quantiles. |
-| [Baseline_Final.ipynb](Baseline_Final.ipynb) | Runs train-mean, last-observation, random-forest, and Chronos-embedding/random-forest baselines; combines baseline and main-model metrics. |
-| [Overview_Results.ipynb](Overview_Results.ipynb) | Summarizes saved predictions, inspects participant trajectories and selected hyperparameters, and combines results with baseline metrics. |
-| [precompute_dtw_cache.R](precompute_dtw_cache.R) | Precomputes bounded dynamic time warping (DTW) comparisons and permutation-based summaries from held-out predictions. |
-| [create_main_paper_figures.R](create_main_paper_figures.R) | Generates performance-comparison and participant-trajectory figures. |
-| [Result_Explorer_App.Rmd](Result_Explorer_App.Rmd) | Runs an interactive Shiny R Markdown result explorer with model comparisons, participant predictions, and DTW summaries. |
-| [models/](models/) | Supporting Python modules for projection heads, ResNet time-series encoders, Llama, and analysis utilities used by exploratory work. |
-| [Old Notebooks/](Old%20Notebooks/) | Historical experiments and earlier implementations. Start with the top-level notebooks listed above. |
+| `FeatureCreation_SensingSchiophrenia.ipynb` | Cleans sensor streams, constructs EMA symptom scores, and exports participant time-series bundles. |
+| `MainModel1_Combined_Head.ipynb` | Model 1: frozen Chronos-2 embeddings of combined sensor inputs with a trainable prediction head. |
+| `MainModel2_LoRa_Combined_Head.ipynb` | Model 2: Chronos-2 adaptation with low-rank adaptation (LoRA) and a combined-input prediction head. |
+| `LOCAL_MainModel2_LoRa_Combined_Head.ipynb` | Local Model 2 variant; selects Apple MPS, CUDA, or CPU, in that order of availability. |
+| `MainModel3_Reg.ipynb` | Model 3: Chronos-2 REG-token embeddings with a head predicting the 0.1, 0.5, and 0.9 quantiles. |
+| `Baseline_Final.ipynb` | Runs train-mean, last-observation, random-forest, and Chronos-embedding/random-forest baselines; combines baseline and main-model metrics. |
+| `Overview_Results.ipynb` | Summarizes saved predictions, inspects participant trajectories and selected hyperparameters, and combines results with baseline metrics. |
+| `precompute_dtw_cache.R` | Precomputes bounded dynamic time warping (DTW) comparisons and permutation-based summaries from held-out predictions. |
+| `create_main_paper_figures.R` | Generates performance-comparison and participant-trajectory figures. |
+| `Result_Explorer_App.Rmd` | Runs an interactive Shiny R Markdown result explorer with model comparisons, participant predictions, and DTW summaries. |
+| `models/` | Supporting Python modules for projection heads, ResNet time-series encoders, Llama, and analysis utilities used by exploratory work. |
+| `Old Notebooks/` | Historical experiments and earlier implementations. Start with the top-level notebooks listed above. |
 
 ## Environment and paths
 
@@ -116,7 +116,7 @@ Each main-model result folder contains `results_<participant>_<outcome>.pth`, wi
 
 `Overview_Results.ipynb` writes `results_true_pred/results_summary_table.csv`. The shared `model_and_baseline_results.csv` supplies participant-level comparisons for the R workflow. The figure script currently saves `Results1.png` and `Results2.png` to absolute local paths. The explorer reads saved DTW caches and can compute a missing participant-level cache on demand.
 
-The project-level [model output structure README](../README_model_output_structure.md) provides additional background on split metadata and checkpoints. Its `main_*` / `combined_only_*` folder names and run-switch examples describe an older layout; use the model names and `FINAL_VARIANTS` documented here for the current notebooks.
+The project-level `../README_model_output_structure.md` provides additional background on split metadata and checkpoints. Its `main_*` / `combined_only_*` folder names and run-switch examples describe an older layout; use the model names and `FINAL_VARIANTS` documented here for the current notebooks.
 
 ## Reproducing a run
 
