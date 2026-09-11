@@ -113,7 +113,3 @@ Each main-model result folder contains `results_<participant>_<outcome>.pth`, wi
 `Overview_Results.ipynb` writes `results_true_pred/results_summary_table.csv`. The shared `model_and_baseline_results.csv` supplies participant-level comparisons for the R workflow. The figure script currently saves `Results1.png` and `Results2.png` to absolute local paths. The explorer reads saved DTW caches and can compute a missing participant-level cache on demand.
 
 The project-level `../README_model_output_structure.md` provides additional background on split metadata and checkpoints. Its `main_*` / `combined_only_*` folder names and run-switch examples describe an older layout; use the model names and `FINAL_VARIANTS` documented here for the current notebooks.
-
-## Reproducing a run
-
-Record the notebook version, package versions, participant list, outcome list, feature window, split settings, seed settings, and enabled variants together with the results. Keep model and baseline preprocessing and splits aligned. Start with one participant and one outcome to check paths, data availability, and outputs before expanding the run. This README was checked against the source files; the training and analysis workflow was not executed as part of the documentation update.
