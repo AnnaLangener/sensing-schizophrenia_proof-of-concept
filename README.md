@@ -19,28 +19,6 @@ Research notebooks and R scripts for predicting negative, cognitive, and positiv
 | `Result_Explorer_App.Rmd` | Runs an interactive Shiny R Markdown result explorer with model comparisons, participant predictions, and DTW summaries. |
 
 
-## Environment and paths
-
-Use Jupyter locally or Google Colab for the Python notebooks. The main Colab notebooks mount Google Drive and load `amazon/chronos-2`; initial model loading requires access to its pretrained weights. Review the pipeline device settings before running locally: the Colab setup selects CUDA, while the local Model 2 notebook provides device selection.
-
-Dependencies referenced by the active workflow include:
-
-- **Python:** NumPy, pandas, PyTorch, SciPy, scikit-learn, Matplotlib, seaborn, and IPython/Jupyter. Model notebooks install `chronos-forecasting>=2.0`; Model 2 also installs `peft` and `torchao>=0.16.0`. `Overview_Results.ipynb` uses `itables`.
-- **R:** `rmarkdown`, `shiny`, `reticulate`, `dplyr`, `tibble`, `tidyr`, `ggplot2`, `stringr`, `purrr`, `patchwork`, `hrbrthemes`, `tidytext`, and `ggh4x` across the scripts and explorer. Reticulate needs a Python environment with PyTorch and NumPy to read prediction files.
-
-Before execution, update the following settings for your machine:
-
-| Component | Settings to review |
-| --- | --- |
-| Feature creation | `base_dir`, `participant_id`, and the full output path passed to `np.savez`. |
-| Main models | `BASE_DIR`, pipeline/device settings, `participant_ids`, `outcomes`, and the training configuration. Remove or skip Colab-specific mounting cells for local runs. |
-| Baselines | `LOCAL_DATA_ROOT`, `COLAB_DATA_ROOT`, embedding roots, `PRECOMPUTED_EMBEDDING_ROOT`, `OUTPUT_ROOT`, and the later `BASELINE_RESULTS_PATH`. |
-| Results overview | `BASE_DIR` and the baseline CSV path in the comparison section. |
-| DTW precomputation | `RESULTS_ROOT` environment variable; caches are written beside the script in `Code/dtw_cache/`. |
-| Result explorer | `BASE_DIR`, `APP_DIR`, and `DTW_CACHE_DIR`; configure `RETICULATE_PYTHON` before Python initializes. |
-| Paper figures | `BASE_DIR`, `APP_DIR`, `PYTHON_PATH`, and the absolute paths in the final `ggsave` calls. |
-
-The explorer currently points its cache directory to a separate local project folder. Set its `APP_DIR` to this `Code` directory, or explicitly align `DTW_CACHE_DIR` with the precomputation output. In the figure script, changing `APP_DIR` alone does not change the hard-coded figure destinations.
 
 ## Input data
 
@@ -74,21 +52,6 @@ The current main-model loops use `combined` as input. They sort samples by times
 4. **Build comparison tables.** Run the baseline notebook's “Compare with main results” section after setting `BASELINE_RESULTS_PATH` to the CSV just generated. Use `Overview_Results.ipynb` for additional summaries and inspection. Its comparison section can also write the combined summary.
 5. **Explore and plot.** With result paths and the R/Python environment configured, run the commands below from `Code/`.
 
-```sh
-# Optional: precompute DTW caches for the three main models.
-# Export RESULTS_ROOT first if the default project path is different.
-Rscript precompute_dtw_cache.R
-
-# Generate the paper figures after editing their output paths.
-Rscript create_main_paper_figures.R
-
-# Launch the interactive result explorer.
-Rscript -e 'rmarkdown::run("Result_Explorer_App.Rmd")'
-```
-
-The checked-in main-model configuration uses an outer training window of 135 observations, test windows of 3, and a step of 3; inner validation uses 21 observations with a step of 114. These sizes count observations, not calendar days. Participants need enough retained observations for at least one outer split.
-
-Only `no_retrain_single` is active in `FINAL_VARIANTS`, with augmentation set to `none`. Other variant definitions are commented out. The active variant evaluates the selected inner-validation model without retraining on the full outer training window. Use `FINAL_VARIANTS` in the current notebooks as the configuration reference; older documentation describes different switches.
 
 ## Outputs
 
