@@ -42,7 +42,6 @@ The model notebooks read `deeplearning_data/pred/participant_<id>_4h.npz`. Each 
 
 The current main-model loops use `combined` as input. They sort samples by timestamp, round labels and divide by 100, and remove the first questionnaire. The baseline configuration also sets `drop_first_sample=True`; preserve this alignment for comparisons.
 
-**Feature-window settings need to match the model inputs.** The active feature-export cell currently uses `LOOKBACK = "24H"`, excludes the four-hour EMA recall window, and writes `participant_<id>_24h.npz`. To create the four-hour inputs expected by the model notebooks, change both `LOOKBACK` and the export filename suffix to four hours. Alternatively, retain the 24-hour window and consistently update all downstream loaders. Renaming a file alone does not change its feature window.
 
 ## Running the workflow
 
