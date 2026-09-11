@@ -1,0 +1,4787 @@
+---
+title: "Predicting Schizophrenia Symptoms From Passive Smartphone Sensing: Limited and Heterogeneous Out-of-Sample Performance"
+output: html_document
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+
+library(shiny)
+library(reticulate)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(hrbrthemes)
+library(purrr)
+library(patchwork)
+
+
+# =============================================================================
+# Paths
+# =============================================================================
+
+BASE_DIR <- paste0(
+  "/Users/f007qrc/Library/CloudStorage/",
+  "GoogleDrive-anna.m.langener@dartmouth.edu/",
+  ".shortcut-targets-by-id/",
+  "1_T-CzrkNtF9QAhex6qrEOA0ZQIL7g5u5/",
+  "SensingIndividualized"
+)
+
+RESULTS_ROOT <- file.path(
+  BASE_DIR,
+  "results_true_pred"
+)
+
+
+# =============================================================================
+# Colors
+# =============================================================================
+participant_colors <- c(
+  "#F04E37",  # strong Aperol orange
+  "#FF9A6E",  # peach coral
+  "#D97A2B",  # burnt orange
+  "#EED9A0",  # pale sand
+  "#C9A45A",  # deeper sandy gold
+  "#89D0EA",  # light sky blue
+  "#4C9BC8",  # coastal blue
+  "#2D6D98"   # deep ocean blue
+)
+
+
+
+TRUE_COLOR <- "#2D6D98"
+PRED_COLOR <- "#FF9A6E"
+
+DTW_COLOR <- "#2D6D98"
+NULL_COLOR <- "#EED9A0"
+
+
+# =============================================================================
+# DTW settings
+# =============================================================================
+
+N_PERM <- 500
+DTW_SEED <- 0
+DTW_WARPING_RADII <- c(
+  0, 1, 2, 3, 5, 8, 12, 20, Inf
+)
+# Keep the cached 20-step results available, but exclude that exploratory
+# radius from every displayed and reported DTW result.
+DTW_HIDDEN_DISPLAY_RADII <- 20
+DTW_DISPLAY_WARPING_RADII <- DTW_WARPING_RADII[
+  !(is.finite(DTW_WARPING_RADII) &
+      DTW_WARPING_RADII %in% DTW_HIDDEN_DISPLAY_RADII)
+]
+
+APP_DIR <- "/Users/f007qrc/Library/CloudStorage/GoogleDrive-anna.m.langener@dartmouth.edu/My Drive/Darmouth Drive/6_PersonalizedSensingSchizophrenia"
+DTW_CACHE_DIR <- file.path(APP_DIR, "dtw_cache")
+DTW_CACHE_VERSION <- "bounded_dtw_v1"
+
+dtw_cache_context <- function(
+  selected_files,
+  model,
+  participant_id,
+  correlation_method,
+  n_perm,
+  warping_radii,
+  seed,
+  checkpoint_transfer_personal_weight = NULL,
+  similarity_transfer_top_k = NULL
+) {
+  source_info <- file.info(selected_files$path)
+
+  context <- list(
+    cache_version = DTW_CACHE_VERSION,
+    model = as.character(model),
+    participant_id = as.character(participant_id),
+    correlation_method = as.character(correlation_method),
+    n_perm = as.integer(n_perm),
+    seed = as.integer(seed),
+    warping_radii = as.character(warping_radii),
+    source_files = data.frame(
+      path = normalizePath(selected_files$path, mustWork = FALSE),
+      size = unname(source_info$size),
+      modified_utc = format(source_info$mtime, tz = "UTC", usetz = TRUE),
+      stringsAsFactors = FALSE
+    )
+  )
+
+  # A custom transfer blend has different predictions and therefore requires
+  # a separate DTW cache. The saved 60/40 blend keeps the existing cache key.
+  if (!is.null(checkpoint_transfer_personal_weight)) {
+    context$checkpoint_transfer_personal_weight <- sprintf(
+      "%.2f",
+      checkpoint_transfer_personal_weight
+    )
+  }
+
+  if (!is.null(similarity_transfer_top_k)) {
+    context$similarity_transfer_top_k <- as.integer(similarity_transfer_top_k)
+  }
+
+  context
+}
+
+dtw_cache_path <- function(cache_dir, context) {
+  safe_part <- function(x) gsub("[^A-Za-z0-9_-]", "_", x)
+  blend_suffix <- if (!is.null(context$checkpoint_transfer_personal_weight)) {
+    paste0("_personal_", context$checkpoint_transfer_personal_weight)
+  } else {
+    ""
+  }
+  similarity_suffix <- if (!is.null(context$similarity_transfer_top_k)) {
+    paste0("_top_", context$similarity_transfer_top_k)
+  } else {
+    ""
+  }
+
+  file.path(
+    cache_dir,
+    paste0(
+      "dtw_", safe_part(context$model),
+      "_participant_", safe_part(context$participant_id),
+      "_", safe_part(context$correlation_method),
+      "_perm_", context$n_perm, blend_suffix, similarity_suffix, ".rds"
+    )
+  )
+}
+
+read_dtw_cache <- function(cache_dir, context) {
+  cache_file <- dtw_cache_path(cache_dir, context)
+
+  if (!file.exists(cache_file)) {
+    return(NULL)
+  }
+
+  cached <- tryCatch(readRDS(cache_file), error = function(e) NULL)
+
+  if (
+    is.null(cached) ||
+    is.null(cached$context) ||
+    is.null(cached$data) ||
+    !identical(cached$context, context)
+  ) {
+    return(NULL)
+  }
+
+  cached$data
+}
+
+write_dtw_cache <- function(cache_dir, context, data) {
+  dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+
+  cache_file <- dtw_cache_path(cache_dir, context)
+  temporary_file <- tempfile(pattern = "dtw_cache_", tmpdir = cache_dir)
+  saveRDS(list(context = context, data = data), temporary_file)
+
+  if (!file.rename(temporary_file, cache_file)) {
+    file.copy(temporary_file, cache_file, overwrite = TRUE)
+    unlink(temporary_file)
+  }
+}
+
+
+prepare_dtw_display_results <- function(dtw_df) {
+  visible_dtw <- dtw_df %>%
+    filter(
+      !(is.finite(warping_radius) &
+          warping_radius %in% DTW_HIDDEN_DISPLAY_RADII)
+    ) %>%
+    mutate(
+      warping_radius_index = match(
+        warping_radius_label,
+        as.character(DTW_DISPLAY_WARPING_RADII)
+      )
+    )
+
+  display_summary <- visible_dtw %>%
+    group_by(outcome) %>%
+    summarise(
+      pointwise_distance = {
+        pointwise_idx <- match("0", warping_radius_label)
+        if (is.na(pointwise_idx)) NA_real_ else d_real[pointwise_idx]
+      },
+      effective_warping_index = {
+        effective_idx <- which(d_real < null_p05)[1]
+        if (is.na(effective_idx)) NA_real_ else warping_radius_index[effective_idx]
+      },
+      effective_warping_label = {
+        effective_idx <- which(d_real < null_p05)[1]
+        if (is.na(effective_idx)) "None" else warping_radius_label[effective_idx]
+      },
+      effective_dtw_distance = {
+        effective_idx <- which(d_real < null_p05)[1]
+        if (is.na(effective_idx)) NA_real_ else d_real[effective_idx]
+      },
+      effective_dtw_p_value = {
+        effective_idx <- which(d_real < null_p05)[1]
+        if (is.na(effective_idx)) NA_real_ else null_p_value[effective_idx]
+      },
+      .groups = "drop"
+    )
+
+  visible_dtw %>%
+    select(-any_of(c(
+      "pointwise_distance",
+      "effective_warping_index",
+      "effective_warping_label",
+      "effective_dtw_distance",
+      "effective_dtw_p_value"
+    ))) %>%
+    left_join(display_summary, by = "outcome")
+}
+
+# =============================================================================
+# Find model folders automatically
+# =============================================================================
+
+MAIN_MODEL_DIRS <- c(
+  "Model1_Frozen_Combined_no_retrain_single",
+  "Model2_LoRA_Combined_no_retrain_single",
+  "Model3_reg_quantile_no_retrain_single"
+)
+
+CHECKPOINT_TRANSFER_MODEL_CHOICES <- c()
+CHECKPOINT_TRANSFER_MODEL_DIRS <- unname(CHECKPOINT_TRANSFER_MODEL_CHOICES)
+SIMILARITY_TRANSFER_MODEL_DIRS <- character()
+CHECKPOINT_TRANSFER_MODEL_LABELS <- setNames(
+  names(CHECKPOINT_TRANSFER_MODEL_CHOICES),
+  CHECKPOINT_TRANSFER_MODEL_DIRS
+)
+
+MODEL_DIRS <- list.dirs(
+  RESULTS_ROOT,
+  recursive = FALSE,
+  full.names = FALSE
+)
+
+
+MODEL_DIRS <- MODEL_DIRS[
+  
+  sapply(
+    
+    MODEL_DIRS,
+    
+    function(model) {
+      
+      length(
+        list.files(
+          file.path(
+            RESULTS_ROOT,
+            model
+          ),
+          pattern =
+            "^results_[0-9]+_(negative|cognitive|positive)\\.pth$"
+        )
+      ) > 0
+      
+    }
+  )
+]
+
+
+PRIMARY_MODEL_DIRS <- sort(
+  intersect(
+    MODEL_DIRS,
+    MAIN_MODEL_DIRS
+  )
+)
+
+CHECKPOINT_TRANSFER_AVAILABLE_DIRS <- intersect(
+  CHECKPOINT_TRANSFER_MODEL_DIRS,
+  MODEL_DIRS
+)
+CHECKPOINT_TRANSFER_AVAILABLE_NAMES <- unname(
+  CHECKPOINT_TRANSFER_MODEL_LABELS[CHECKPOINT_TRANSFER_AVAILABLE_DIRS]
+)
+
+model_result_filenames <- function(model_dir) {
+  list.files(
+    file.path(RESULTS_ROOT, model_dir),
+    pattern = "^results_[0-9]+_(negative|cognitive|positive)\\.pth$",
+    full.names = FALSE
+  )
+}
+
+# Do not let a partially generated transfer variant enter rankings against
+# complete models. It remains available in the prediction explorer for checks.
+MODEL1_RESULT_FILENAMES <- model_result_filenames(MAIN_MODEL_DIRS[1])
+CHECKPOINT_TRANSFER_COMPARISON_DIRS <- Filter(
+  function(model_dir) {
+    identical(
+      sort(model_result_filenames(model_dir)),
+      sort(MODEL1_RESULT_FILENAMES)
+    )
+  },
+  CHECKPOINT_TRANSFER_AVAILABLE_DIRS
+)
+CHECKPOINT_TRANSFER_COMPARISON_NAMES <- unname(
+  CHECKPOINT_TRANSFER_MODEL_LABELS[CHECKPOINT_TRANSFER_COMPARISON_DIRS]
+)
+
+MODEL_DIRS <- c(
+  PRIMARY_MODEL_DIRS,
+  CHECKPOINT_TRANSFER_AVAILABLE_DIRS
+)
+
+# This virtual model is calculated in the app from the three saved model
+# predictions. It is never written to the source result files.
+ENSEMBLE_MODEL_NAME <- "Exploratory mean ensemble (all 3 main models)"
+MODEL_CHOICES <- c(
+  setNames(
+    MODEL_DIRS,
+    unname(ifelse(
+      MODEL_DIRS %in% CHECKPOINT_TRANSFER_MODEL_DIRS,
+      CHECKPOINT_TRANSFER_MODEL_LABELS[MODEL_DIRS],
+      MODEL_DIRS
+    ))
+  ),
+  ENSEMBLE_MODEL_NAME
+)
+
+model_display_name <- function(model_name) {
+  unname(ifelse(
+    model_name %in% CHECKPOINT_TRANSFER_MODEL_DIRS,
+    CHECKPOINT_TRANSFER_MODEL_LABELS[model_name],
+    model_name
+  ))
+}
+
+is_checkpoint_transfer_model <- function(model_name) {
+  model_name %in% CHECKPOINT_TRANSFER_MODEL_DIRS
+}
+
+is_similarity_transfer_model <- function(model_name) {
+  model_name %in% SIMILARITY_TRANSFER_MODEL_DIRS
+}
+
+
+# =============================================================================
+# Python helper for loading .pth files
+# =============================================================================
+
+py_run_string("
+import torch
+import numpy as np
+
+def _append_rows(
+    rows,
+    outer_i,
+    split_name,
+    y_true,
+    y_pred,
+    y_pred_personal=None,
+    y_pred_other_participants=None
+):
+
+    y_true = np.asarray(y_true).reshape(-1)
+    y_pred = np.asarray(y_pred).reshape(-1)
+
+    if len(y_true) != len(y_pred):
+        return
+
+    if y_pred_personal is not None:
+        y_pred_personal = np.asarray(y_pred_personal).reshape(-1)
+        if len(y_pred_personal) != len(y_pred):
+            y_pred_personal = None
+
+    if y_pred_other_participants is not None:
+        y_pred_other_participants = np.asarray(y_pred_other_participants).reshape(-1)
+        if len(y_pred_other_participants) != len(y_pred):
+            y_pred_other_participants = None
+
+    for j, (yt, yp) in enumerate(zip(y_true, y_pred)):
+        rows.append({
+            'outer_i': int(outer_i),
+            'split': split_name,
+            'point_i': int(j),
+            'y_true': float(yt),
+            'y_pred': float(yp),
+            'y_pred_personal': (
+                float(y_pred_personal[j]) if y_pred_personal is not None else np.nan
+            ),
+            'y_pred_other_participants': (
+                float(y_pred_other_participants[j])
+                if y_pred_other_participants is not None else np.nan
+            )
+        })
+
+
+def similarity_matched_other_prediction(fold, top_k):
+
+    source_predictions = fold.get('source_participant_predictions')
+    similarity_info = fold.get('similarity_matched_transfer', {})
+    source_similarity = similarity_info.get('source_trajectory_similarity', {})
+
+    if not isinstance(source_predictions, dict) or not isinstance(source_similarity, dict):
+        return None
+
+    expected_length = len(np.asarray(fold.get('y_pred', [])).reshape(-1))
+    candidates = []
+
+    for source, prediction in source_predictions.items():
+        try:
+            similarity = float(source_similarity.get(source, np.nan))
+        except (TypeError, ValueError):
+            continue
+
+        prediction = np.asarray(prediction).reshape(-1)
+        if np.isfinite(similarity) and len(prediction) == expected_length:
+            candidates.append((str(source), similarity, prediction))
+
+    candidates.sort(key=lambda candidate: (-candidate[1], candidate[0]))
+
+    if not candidates:
+        return None
+
+    selected_predictions = [candidate[2] for candidate in candidates[:int(top_k)]]
+    return np.mean(selected_predictions, axis=0)
+
+
+def load_prediction_file(path, similarity_top_k=None):
+
+    try:
+        folds = torch.load(
+            path,
+            map_location='cpu',
+            weights_only=False
+        )
+    except TypeError:
+        folds = torch.load(
+            path,
+            map_location='cpu'
+        )
+
+    rows = []
+
+    for i, fold in enumerate(folds):
+
+        outer_i = fold.get('outer_i', i)
+
+        y_pred = fold.get('y_pred', [])
+        y_pred_personal = fold.get('y_pred_personal')
+        y_pred_other_participants = fold.get('y_pred_other_participants')
+
+        if similarity_top_k is not None and 'source_participant_predictions' in fold:
+            y_pred_other_participants = similarity_matched_other_prediction(
+                fold,
+                similarity_top_k
+            )
+
+            if y_pred_other_participants is None:
+                raise ValueError(
+                    'No valid stored source predictions were available for the requested similarity top-K.'
+                )
+
+            if y_pred_personal is None:
+                y_pred_personal = fold.get('y_pred', [])
+
+            y_pred = (
+                0.60 * np.asarray(y_pred_personal).reshape(-1)
+                + 0.40 * np.asarray(y_pred_other_participants).reshape(-1)
+            )
+
+        _append_rows(
+            rows,
+            outer_i,
+            'test',
+            fold.get('y_test', []),
+            y_pred,
+            y_pred_personal,
+            y_pred_other_participants
+        )
+
+    return rows
+")
+
+
+# =============================================================================
+# Find result files
+# =============================================================================
+
+get_available_results <- function(
+  model_name
+) {
+  
+  results_dir <- file.path(
+    RESULTS_ROOT,
+    model_name
+  )
+  
+  
+  files <- list.files(
+    results_dir,
+    pattern =
+      "^results_[0-9]+_(negative|cognitive|positive)\\.pth$",
+    full.names = TRUE
+  )
+  
+  
+  if (length(files) == 0) {
+    
+    return(
+      tibble(
+        path = character(),
+        participant_id = character(),
+        outcome = character(),
+        model = character()
+      )
+    )
+  }
+  
+  
+  tibble(
+    path = files,
+    filename = basename(files)
+  ) %>%
+    
+    extract(
+      filename,
+      into = c(
+        "participant_id",
+        "outcome"
+      ),
+      regex =
+        "^results_([0-9]+)_(negative|cognitive|positive)\\.pth$",
+      remove = TRUE
+    ) %>%
+    
+    mutate(
+      participant_id = sprintf(
+        "%05d",
+        as.integer(participant_id)
+      ),
+      model = model_name
+    ) %>%
+    
+    arrange(
+      participant_id,
+      outcome
+    )
+}
+
+
+# Only expose ensemble combinations for which every main model has a matching
+# participant-outcome file. This prevents averaging different test series.
+get_ensemble_available_results <- function() {
+
+  model_results <- bind_rows(
+    lapply(
+      MODEL_DIRS,
+      get_available_results
+    )
+  )
+
+  if (nrow(model_results) == 0) {
+    return(model_results)
+  }
+
+  model_results %>%
+    group_by(
+      participant_id,
+      outcome
+    ) %>%
+    filter(
+      n_distinct(model) == length(MAIN_MODEL_DIRS),
+      n() == length(MAIN_MODEL_DIRS)
+    ) %>%
+    ungroup() %>%
+    arrange(
+      participant_id,
+      outcome,
+      model
+    )
+}
+
+
+# =============================================================================
+# Load one result
+# =============================================================================
+
+load_predictions <- function(
+  path,
+  participant_id,
+  outcome,
+  model,
+  similarity_top_k = NULL
+) {
+  
+  rows <- if (is.null(similarity_top_k)) {
+    py$load_prediction_file(path)
+  } else {
+    py$load_prediction_file(path, as.integer(similarity_top_k))
+  }
+  
+  rows <- py_to_r(
+    rows
+  )
+  
+  
+  if (length(rows) == 0) {
+    return(tibble())
+  }
+  
+  
+  bind_rows(
+    rows
+  ) %>%
+    
+    mutate(
+      participant_id = participant_id,
+      outcome = outcome,
+      model = model
+    )
+}
+
+
+# =============================================================================
+# Load multiple files
+# =============================================================================
+
+load_selected_results <- function(
+  selected_files,
+  similarity_top_k = NULL
+) {
+  
+  if (nrow(selected_files) == 0) {
+    return(tibble())
+  }
+  
+  
+  result_list <- vector(
+    "list",
+    nrow(selected_files)
+  )
+  
+  
+  for (
+    i in seq_len(
+      nrow(selected_files)
+    )
+  ) {
+    
+    result_list[[i]] <- load_predictions(
+      path = selected_files$path[i],
+      participant_id = selected_files$participant_id[i],
+      outcome = selected_files$outcome[i],
+      model = selected_files$model[i],
+      similarity_top_k = similarity_top_k
+    )
+  }
+  
+  
+  bind_rows(
+    result_list
+  )
+}
+
+
+# Average only predictions with identical participant, symptom, outer-fold,
+# and within-fold positions. Matching truth values are required as a guard
+# against accidentally combining differently ordered result files.
+make_mean_ensemble <- function(prediction_rows) {
+
+  key_columns <- c(
+    "participant_id",
+    "outcome",
+    "outer_i",
+    "split",
+    "point_i"
+  )
+
+  expected_models <- sort(MAIN_MODEL_DIRS)
+  observed_models <- sort(unique(prediction_rows$model))
+
+  if (!identical(observed_models, expected_models)) {
+    stop(
+      "The exploratory ensemble requires one prediction file from each of the three main models."
+    )
+  }
+
+  alignment_check <- prediction_rows %>%
+    group_by(across(all_of(key_columns))) %>%
+    summarise(
+      model_count = n_distinct(model),
+      row_count = n(),
+      truth_range = max(y_true) - min(y_true),
+      .groups = "drop"
+    )
+
+  if (any(
+    alignment_check$model_count != length(MAIN_MODEL_DIRS) |
+      alignment_check$row_count != length(MAIN_MODEL_DIRS) |
+      alignment_check$truth_range > 1e-8
+  )) {
+    stop(
+      "The three model outputs do not have the same test observations, so their predictions cannot be averaged safely."
+    )
+  }
+
+  prediction_rows %>%
+    group_by(across(all_of(key_columns))) %>%
+    summarise(
+      y_true = first(y_true),
+      y_pred = mean(y_pred),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      model = ENSEMBLE_MODEL_NAME
+    )
+}
+
+
+# Recalculate the saved checkpoint-transfer blend from its two stored
+# components. This is instantaneous and never reloads a PyTorch checkpoint.
+make_checkpoint_transfer_blend <- function(
+  prediction_rows,
+  personal_weight
+) {
+
+  required_columns <- c(
+    "y_pred_personal",
+    "y_pred_other_participants"
+  )
+
+  if (!all(required_columns %in% names(prediction_rows))) {
+    stop(
+      "These checkpoint-transfer result files do not contain the two prediction components needed to change the blend."
+    )
+  }
+
+  if (any(!is.finite(prediction_rows$y_pred_personal)) ||
+      any(!is.finite(prediction_rows$y_pred_other_participants))) {
+    stop(
+      "The checkpoint-transfer result files have missing prediction components, so the blend cannot be recalculated safely."
+    )
+  }
+
+  other_participants_weight <- 1 - personal_weight
+
+  prediction_rows %>%
+    mutate(
+      y_pred =
+        personal_weight * y_pred_personal +
+        other_participants_weight * y_pred_other_participants,
+      model = model_display_name(model)
+    )
+}
+
+
+# =============================================================================
+# Safe correlation
+# =============================================================================
+
+safe_cor <- function(
+  x,
+  y,
+  method = "pearson"
+) {
+  
+  keep <- complete.cases(
+    x,
+    y
+  )
+  
+  x <- x[keep]
+  y <- y[keep]
+  
+  
+  if (
+    length(x) < 2 ||
+    sd(x) == 0 ||
+    sd(y) == 0
+  ) {
+    
+    return(
+      NA_real_
+    )
+  }
+  
+  
+  cor(
+    x,
+    y,
+    method = method
+  )
+}
+
+
+# =============================================================================
+# Safe correlation test
+# =============================================================================
+
+safe_cor_test <- function(
+  x,
+  y,
+  method = "pearson"
+) {
+  
+  keep <- complete.cases(
+    x,
+    y
+  )
+  
+  x <- x[keep]
+  y <- y[keep]
+  
+  if (
+    length(x) < 3 ||
+    sd(x) == 0 ||
+    sd(y) == 0
+  ) {
+    
+    return(
+      tibble(
+        r = NA_real_,
+        p = NA_real_
+      )
+    )
+  }
+  
+  if (method == "spearman") {
+    test <- cor.test(
+      x,
+      y,
+      method = "spearman",
+      exact = FALSE
+    )
+  } else {
+    test <- cor.test(
+      x,
+      y,
+      method = "pearson"
+    )
+  }
+  
+tibble(
+    r = unname(test$estimate),
+    p = test$p.value
+  )
+}
+
+
+# =============================================================================
+# Pointwise metric helpers
+# =============================================================================
+
+clean_metric_pair <- function(
+  y_true,
+  y_pred
+) {
+
+  keep <- complete.cases(
+    y_true,
+    y_pred
+  )
+
+  list(
+    y_true = as.numeric(y_true[keep]),
+    y_pred = as.numeric(y_pred[keep])
+  )
+}
+
+
+safe_mse <- function(
+  y_true,
+  y_pred
+) {
+
+  clean <- clean_metric_pair(
+    y_true,
+    y_pred
+  )
+
+  if (length(clean$y_true) == 0) {
+    return(NA_real_)
+  }
+
+  mean(
+    (clean$y_true - clean$y_pred)^2
+  )
+}
+
+
+safe_mae <- function(
+  y_true,
+  y_pred
+) {
+
+  clean <- clean_metric_pair(
+    y_true,
+    y_pred
+  )
+
+  if (length(clean$y_true) == 0) {
+    return(NA_real_)
+  }
+
+  mean(
+    abs(clean$y_true - clean$y_pred)
+  )
+}
+
+
+safe_rmse <- function(
+  y_true,
+  y_pred
+) {
+
+  mse <- safe_mse(
+    y_true,
+    y_pred
+  )
+
+  if (is.na(mse)) {
+    return(NA_real_)
+  }
+
+  sqrt(mse)
+}
+
+
+safe_r2 <- function(
+  y_true,
+  y_pred
+) {
+
+  clean <- clean_metric_pair(
+    y_true,
+    y_pred
+  )
+
+  if (length(clean$y_true) == 0) {
+    return(NA_real_)
+  }
+
+  sst <- sum(
+    (clean$y_true - mean(clean$y_true))^2
+  )
+
+  if (sst == 0) {
+    return(NA_real_)
+  }
+
+  sse <- sum(
+    (clean$y_true - clean$y_pred)^2
+  )
+
+  1 - sse / sst
+}
+
+
+# =============================================================================
+# Bounded DTW
+#
+# Sakoe-Chiba band + absolute local distance.
+# With w = 0 and equally long series, this reduces to MAE.
+# =============================================================================
+
+bounded_dtw <- function(
+  y_true,
+  y_pred,
+  warping_radius
+) {
+  
+  y_true <- as.numeric(y_true)
+  y_pred <- as.numeric(y_pred)
+  
+  
+  keep <- complete.cases(
+    y_true,
+    y_pred
+  )
+  
+  y_true <- y_true[keep]
+  y_pred <- y_pred[keep]
+  
+  
+  if (
+    length(y_true) == 0 ||
+    length(y_pred) == 0
+  ) {
+    
+    return(
+      list(
+        distance = NA_real_,
+        path = NULL
+      )
+    )
+  }
+  
+  
+  n_true <- length(y_true)
+  n_pred <- length(y_pred)
+  
+  if (is.finite(warping_radius)) {
+
+    radius <- max(
+      0,
+      as.integer(warping_radius)
+    )
+
+  } else {
+
+    radius <- max(
+      n_true,
+      n_pred
+    )
+  }
+  
+  
+  costs <- matrix(
+    Inf,
+    nrow = n_true + 1,
+    ncol = n_pred + 1
+  )
+  
+  
+  back <- matrix(
+    NA_integer_,
+    nrow = n_true + 1,
+    ncol = n_pred + 1
+  )
+  
+  
+  costs[1, 1] <- 0
+  
+  
+  for (i in seq_len(n_true)) {
+    
+    j_start <- max(
+      1,
+      i - radius
+    )
+    
+    j_end <- min(
+      n_pred,
+      i + radius
+    )
+    
+    
+    for (j in j_start:j_end) {
+      
+      local_cost <- abs(
+        y_true[i] -
+          y_pred[j]
+      )
+      
+      
+      candidates <- c(
+        costs[i, j],
+        costs[i, j + 1],
+        costs[i + 1, j]
+      )
+      
+      
+      move <- which.min(
+        candidates
+      )
+      
+      
+      best_prev <- candidates[
+        move
+      ]
+      
+      
+      if (is.finite(best_prev)) {
+        
+        costs[
+          i + 1,
+          j + 1
+        ] <- local_cost +
+          best_prev
+        
+        back[
+          i + 1,
+          j + 1
+        ] <- move
+      }
+    }
+  }
+  
+  
+  if (
+    !is.finite(
+      costs[
+        n_true + 1,
+        n_pred + 1
+      ]
+    )
+  ) {
+    
+    return(
+      list(
+        distance = NA_real_,
+        path = NULL
+      )
+    )
+  }
+  
+  
+  # ---------------------------------------------------------------------------
+  # Backtrack optimal path
+  # ---------------------------------------------------------------------------
+  
+  path_i <- integer()
+  path_j <- integer()
+  
+  i <- n_true
+  j <- n_pred
+  
+  
+  while (
+    i > 0 &&
+    j > 0
+  ) {
+    
+    path_i <- c(
+      i,
+      path_i
+    )
+    
+    path_j <- c(
+      j,
+      path_j
+    )
+    
+    
+    move <- back[
+      i + 1,
+      j + 1
+    ]
+    
+    
+    if (is.na(move)) {
+      break
+    }
+    
+    
+    if (move == 1) {
+      
+      i <- i - 1
+      j <- j - 1
+      
+    } else if (move == 2) {
+      
+      i <- i - 1
+      
+    } else if (move == 3) {
+      
+      j <- j - 1
+    }
+  }
+  
+  
+  path <- tibble(
+    true_index = path_i,
+    pred_index = path_j
+  )
+  
+  
+  path_length <- max(
+    nrow(path),
+    1
+  )
+  
+  
+  distance <- costs[
+    n_true + 1,
+    n_pred + 1
+  ] /
+    path_length
+
+
+  list(
+    distance = distance,
+    path = path
+  )
+}
+
+
+# =============================================================================
+# Frozen DTW helpers
+# =============================================================================
+
+normalize_series_position <- function(
+  idx,
+  n
+) {
+
+  if (n <= 1) {
+    return(rep(0, length(idx)))
+  }
+
+  (idx - 1) / (n - 1)
+}
+
+
+path_to_warping_curve <- function(
+  path,
+  n_true,
+  n_pred,
+  grid = DTW_FUNCTION_GRID
+) {
+
+  if (
+    is.null(path) ||
+    nrow(path) == 0
+  ) {
+    return(rep(NA_real_, length(grid)))
+  }
+
+  curve_df <- tibble(
+    x = normalize_series_position(
+      path$true_index,
+      n_true
+    ),
+    y = normalize_series_position(
+      path$pred_index,
+      n_pred
+    )
+  ) %>%
+    group_by(x) %>%
+    summarise(
+      y = mean(y),
+      .groups = "drop"
+    ) %>%
+    arrange(x)
+
+  if (nrow(curve_df) == 0) {
+    return(rep(NA_real_, length(grid)))
+  }
+
+  if (nrow(curve_df) == 1) {
+    return(rep(curve_df$y[1], length(grid)))
+  }
+
+  if (curve_df$x[1] > 0) {
+    curve_df <- bind_rows(
+      tibble(
+        x = 0,
+        y = curve_df$y[1]
+      ),
+      curve_df
+    )
+  }
+
+  if (curve_df$x[nrow(curve_df)] < 1) {
+    curve_df <- bind_rows(
+      curve_df,
+      tibble(
+        x = 1,
+        y = curve_df$y[nrow(curve_df)]
+      )
+    )
+  }
+
+  pmin(
+    pmax(
+      approx(
+        x = curve_df$x,
+        y = curve_df$y,
+        xout = grid,
+        method = "linear",
+        rule = 2
+      )$y,
+      0
+    ),
+    1
+  )
+}
+
+
+warp_predictions_with_curve <- function(
+  y_pred,
+  curve,
+  grid = DTW_FUNCTION_GRID
+) {
+
+  y_pred <- as.numeric(y_pred)
+
+  if (
+    length(y_pred) == 0 ||
+    length(curve) == 0 ||
+    all(!is.finite(curve))
+  ) {
+    return(rep(NA_real_, length(y_pred)))
+  }
+
+  if (length(y_pred) == 1) {
+    return(y_pred)
+  }
+
+  test_positions <- normalize_series_position(
+    seq_along(y_pred),
+    length(y_pred)
+  )
+
+  warped_positions <- approx(
+    x = grid,
+    y = curve,
+    xout = test_positions,
+    method = "linear",
+    rule = 2
+  )$y
+
+  warped_indices <- 1 +
+    warped_positions *
+      (length(y_pred) - 1)
+
+  approx(
+    x = seq_along(y_pred),
+    y = y_pred,
+    xout = warped_indices,
+    method = "linear",
+    rule = 2
+  )$y
+}
+
+
+compute_frozen_dtw <- function(
+  symptom_df,
+  n_perm = N_PERM,
+  seed = DTW_SEED
+) {
+
+  fold_dfs <- symptom_df %>%
+    group_by(outer_i) %>%
+    group_split()
+
+  frozen_folds <- list()
+
+  for (fold_df in fold_dfs) {
+
+    val_df <- fold_df %>%
+      filter(split == "validation") %>%
+      arrange(point_i)
+
+    test_df <- fold_df %>%
+      filter(split == "test") %>%
+      arrange(point_i)
+
+    if (
+      nrow(val_df) == 0 ||
+      nrow(test_df) == 0
+    ) {
+      next
+    }
+
+    val_alignment <- bounded_dtw(
+      val_df$y_true,
+      val_df$y_pred,
+      Inf
+    )
+
+    curve <- path_to_warping_curve(
+      val_alignment$path,
+      n_true = nrow(val_df),
+      n_pred = nrow(val_df)
+    )
+
+    if (all(!is.finite(curve))) {
+      next
+    }
+
+    frozen_folds[[length(frozen_folds) + 1]] <- list(
+      val_true = val_df$y_true,
+      val_pred = val_df$y_pred,
+      test_true = test_df$y_true,
+      test_pred = test_df$y_pred,
+      curve = curve
+    )
+  }
+
+  if (length(frozen_folds) == 0) {
+    return(
+      tibble(
+        frozen_distance = NA_real_,
+        frozen_p_value = NA_real_,
+        frozen_null_mean = NA_real_,
+        frozen_null_p05 = NA_real_,
+        frozen_n_folds = 0L
+      )
+    )
+  }
+
+  real_curve <- colMeans(
+    do.call(
+      rbind,
+      lapply(
+        frozen_folds,
+        `[[`,
+        "curve"
+      )
+    ),
+    na.rm = TRUE
+  )
+
+  real_residuals <- unlist(
+    lapply(
+      frozen_folds,
+      function(fold) {
+        aligned_pred <- warp_predictions_with_curve(
+          fold$test_pred,
+          real_curve
+        )
+        abs(fold$test_true - aligned_pred)
+      }
+    )
+  )
+
+  real_distance <- mean(
+    real_residuals,
+    na.rm = TRUE
+  )
+
+  set.seed(seed)
+
+  perm_distances <- rep(
+    NA_real_,
+    n_perm
+  )
+
+  for (p in seq_len(n_perm)) {
+
+    perm_curve <- colMeans(
+      do.call(
+        rbind,
+        lapply(
+          frozen_folds,
+          function(fold) {
+            perm_alignment <- bounded_dtw(
+              fold$val_true,
+              sample(
+                fold$val_pred,
+                replace = FALSE
+              ),
+              Inf
+            )
+
+            path_to_warping_curve(
+              perm_alignment$path,
+              n_true = length(fold$val_true),
+              n_pred = length(fold$val_pred)
+            )
+          }
+        )
+      ),
+      na.rm = TRUE
+    )
+
+    perm_residuals <- unlist(
+      lapply(
+        frozen_folds,
+        function(fold) {
+          aligned_pred <- warp_predictions_with_curve(
+            sample(
+              fold$test_pred,
+              replace = FALSE
+            ),
+            perm_curve
+          )
+
+          abs(fold$test_true - aligned_pred)
+        }
+      )
+    )
+
+    perm_distances[p] <- mean(
+      perm_residuals,
+      na.rm = TRUE
+    )
+  }
+
+  perm_distances <- perm_distances[
+    is.finite(perm_distances)
+  ]
+
+  if (length(perm_distances) == 0) {
+    frozen_p_value <- NA_real_
+    frozen_null_mean <- NA_real_
+    frozen_null_p05 <- NA_real_
+  } else {
+    frozen_p_value <- mean(
+      perm_distances <= real_distance
+    )
+    frozen_null_mean <- mean(
+      perm_distances
+    )
+    frozen_null_p05 <- as.numeric(
+      quantile(
+        perm_distances,
+        0.05
+      )
+    )
+  }
+
+  tibble(
+    frozen_distance = real_distance,
+    frozen_p_value = frozen_p_value,
+    frozen_null_mean = frozen_null_mean,
+    frozen_null_p05 = frozen_null_p05,
+    frozen_n_folds = length(frozen_folds)
+  )
+}
+
+
+# =============================================================================
+# Correlation along DTW path
+# =============================================================================
+
+dtw_path_cor <- function(
+  y_true,
+  y_pred,
+  path,
+  method = "pearson"
+) {
+  
+  if (
+    is.null(path) ||
+    nrow(path) == 0
+  ) {
+    
+    return(
+      NA_real_
+    )
+  }
+  
+  
+  aligned_true <- y_true[
+    path$true_index
+  ]
+  
+  aligned_pred <- y_pred[
+    path$pred_index
+  ]
+  
+  
+  safe_cor(
+    aligned_true,
+    aligned_pred,
+    method = method
+  )
+}
+
+
+# =============================================================================
+# DTW sweep over warping radii
+# =============================================================================
+
+compute_dtw_sweep <- function(
+  y_true,
+  y_pred,
+  warping_radii,
+  n_perm = N_PERM,
+  seed = DTW_SEED,
+  correlation_method = "pearson"
+) {
+  
+  keep <- complete.cases(
+    y_true,
+    y_pred
+  )
+  
+  y_true <- as.numeric(
+    y_true[keep]
+  )
+  
+  y_pred <- as.numeric(
+    y_pred[keep]
+  )
+  
+  
+  corr_raw <- safe_cor(
+    y_true,
+    y_pred,
+    method = correlation_method
+  )
+  
+  
+  set.seed(
+    seed
+  )
+  
+  
+  results <- vector(
+    "list",
+    length(warping_radii)
+  )
+  
+  
+  for (
+    r_i in seq_along(
+      warping_radii
+    )
+  ) {
+    
+    radius <- warping_radii[
+      r_i
+    ]
+    
+    
+    # -------------------------------------------------------------------------
+    # Real model
+    # -------------------------------------------------------------------------
+    
+    real_alignment <- bounded_dtw(
+      y_true,
+      y_pred,
+      radius
+    )
+    
+    
+    d_real <- real_alignment$distance
+    
+    
+    corr_aligned <- dtw_path_cor(
+      y_true,
+      y_pred,
+      real_alignment$path,
+      method = correlation_method
+    )
+    
+    
+    # -------------------------------------------------------------------------
+    # Permutation null
+    # -------------------------------------------------------------------------
+    
+    null_distances <- rep(
+      NA_real_,
+      n_perm
+    )
+    
+    null_corrs <- rep(
+      NA_real_,
+      n_perm
+    )
+    
+    
+    for (
+      p in seq_len(
+        n_perm
+      )
+    ) {
+      
+      perm_pred <- sample(
+        y_pred,
+        replace = FALSE
+      )
+      
+      
+      null_alignment <- bounded_dtw(
+        y_true,
+        perm_pred,
+        radius
+      )
+      
+      
+      null_distances[p] <-
+        null_alignment$distance
+      
+      
+      null_corrs[p] <- dtw_path_cor(
+        y_true,
+        perm_pred,
+        null_alignment$path,
+        method = correlation_method
+      )
+    }
+    
+    
+    null_distances <- null_distances[
+      is.finite(
+        null_distances
+      )
+    ]
+    
+    null_corrs <- null_corrs[
+      is.finite(
+        null_corrs
+      )
+    ]
+    
+    
+    # -------------------------------------------------------------------------
+    # Null summaries
+    # -------------------------------------------------------------------------
+    
+    if (
+      length(null_distances) > 0
+    ) {
+      
+      null_mean <- mean(
+        null_distances
+      )
+      
+      null_sd <- sd(
+        null_distances
+      )
+      
+      null_p05 <- as.numeric(
+        quantile(
+          null_distances,
+          0.05
+        )
+      )
+      
+      null_p_value <- mean(
+        null_distances <=
+          d_real
+      )
+      
+    } else {
+      
+      null_mean <- NA_real_
+      null_sd <- NA_real_
+      null_p05 <- NA_real_
+      null_p_value <- NA_real_
+    }
+    
+    
+    if (
+      length(null_corrs) > 0
+    ) {
+      
+      corr_null_mean <- mean(
+        null_corrs
+      )
+      
+      corr_null_sd <- sd(
+        null_corrs
+      )
+      
+      corr_null_p95 <- as.numeric(
+        quantile(
+          null_corrs,
+          0.95
+        )
+      )
+      
+      corr_null_p_value <- mean(
+        null_corrs >=
+          corr_aligned
+      )
+      
+    } else {
+      
+      corr_null_mean <- NA_real_
+      corr_null_sd <- NA_real_
+      corr_null_p95 <- NA_real_
+      corr_null_p_value <- NA_real_
+    }
+    
+    
+    results[[r_i]] <- tibble(
+      
+      warping_radius = radius,
+      warping_radius_index = r_i,
+      warping_radius_label = if (
+        is.finite(radius)
+      ) {
+        as.character(radius)
+      } else {
+        "Inf"
+      },
+      
+      d_real = d_real,
+      
+      corr_raw = corr_raw,
+      
+      corr_aligned = corr_aligned,
+      
+      null_mean = null_mean,
+      
+      null_sd = null_sd,
+      
+      null_p05 = null_p05,
+      
+      null_p_value = null_p_value,
+      
+      corr_null_mean = corr_null_mean,
+      
+      corr_null_sd = corr_null_sd,
+      
+      corr_null_p95 = corr_null_p95,
+      
+      corr_null_p_value =
+        corr_null_p_value
+    )
+  }
+  
+  
+  bind_rows(
+    results
+  )
+}
+
+
+# =============================================================================
+# Create DTW results for one symptom
+# =============================================================================
+
+get_dtw_for_symptom <- function(
+  symptom_df,
+  correlation_method = "pearson"
+) {
+  compute_dtw_sweep(
+    
+    y_true =
+      symptom_df$y_true,
+    
+    y_pred =
+      symptom_df$y_pred,
+    
+    warping_radii =
+      DTW_WARPING_RADII,
+    
+    n_perm =
+      N_PERM,
+    
+    seed =
+      DTW_SEED,
+    correlation_method =
+      correlation_method
+  )
+}
+
+
+# =============================================================================
+# Outcome labels
+# =============================================================================
+
+outcome_label <- function(
+  x
+) {
+  
+  recode(
+    x,
+    negative = "Negative",
+    cognitive = "Cognitive",
+    positive = "Positive"
+  )
+}
+
+```
+
+# Result Exploration {.tabset}
+
+## Prediction Explorer
+
+### Selection
+
+Use **Exclude participants** to remove one or more participants from the symptom plots and all aggregate performance summaries/rankings. The source data are not modified.
+
+```{r controls, echo=FALSE}
+
+selectInput(
+  
+  inputId = "model",
+  
+  label = "Model:",
+  
+  choices = MODEL_CHOICES,
+  
+  selected = if (
+    
+    "Model1_Frozen_Combined_no_retrain_single" %in%
+      MODEL_DIRS
+    
+  ) {
+    
+    "Model1_Frozen_Combined_no_retrain_single"
+    
+  } else {
+    
+    MODEL_DIRS[1]
+  }
+)
+
+
+selectInput(
+  inputId = "correlation_method",
+  label = "Correlation type:",
+  choices = c(
+    "Pearson" = "pearson",
+    "Spearman (rank)" = "spearman"
+  ),
+  selected = "pearson"
+)
+
+
+selectInput(
+  
+  inputId = "mode",
+  
+  label = "Plot by:",
+  
+  choices = c(
+    "Participant" = "participant",
+    "Symptom" = "symptom"
+  ),
+  
+  selected = "participant"
+)
+
+
+uiOutput("checkpoint_transfer_blend_control")
+
+```
+
+```{r checkpoint-transfer-blend-control, echo=FALSE}
+
+renderUI({
+
+  if (!is_checkpoint_transfer_model(input$model)) {
+    return(NULL)
+  }
+
+  tags$div(
+    class = "well",
+    tags$strong("Exploratory blend"),
+    tags$p(model_display_name(input$model)),
+    sliderInput(
+      inputId = "checkpoint_transfer_personal_weight",
+      label = "Personalized Model 1 weight:",
+      min = 0,
+      max = 1,
+      value = 0.60,
+      step = 0.05
+    ),
+    if (is_similarity_transfer_model(input$model)) {
+      tagList(
+        sliderInput(
+          inputId = "similarity_transfer_top_k",
+          label = "Most-similar source participants per outer fold:",
+          min = 1,
+          max = 3,
+          value = 2,
+          step = 1
+        ),
+        textOutput("similarity_transfer_top_k_label")
+      )
+    },
+    textOutput("checkpoint_transfer_blend_label"),
+    tags$p(
+      class = "help-block",
+      "Changing either control recombines saved predictions only; it does not retrain or re-evaluate any checkpoints."
+    )
+  )
+})
+
+
+checkpoint_transfer_personal_weight <- reactive({
+  if (is.null(input$checkpoint_transfer_personal_weight)) {
+    return(0.60)
+  }
+
+  as.numeric(input$checkpoint_transfer_personal_weight)
+})
+
+
+similarity_transfer_top_k <- reactive({
+  if (is.null(input$similarity_transfer_top_k)) {
+    return(2L)
+  }
+
+  as.integer(input$similarity_transfer_top_k)
+})
+
+
+output$checkpoint_transfer_blend_label <- renderText({
+  personal_weight <- checkpoint_transfer_personal_weight()
+  sprintf(
+    "Current prediction: %.0f%% personalized Model 1 + %.0f%% other-participant checkpoints",
+    100 * personal_weight,
+    100 * (1 - personal_weight)
+  )
+})
+
+
+output$similarity_transfer_top_k_label <- renderText({
+  sprintf(
+    "Current transfer prediction: mean of the top %d most-similar eligible source participants in each outer fold.",
+    similarity_transfer_top_k()
+  )
+})
+
+```
+
+```{r participant-only-visibility, echo=FALSE}
+tags$style(HTML("
+  .participant-only, .symptom-dtw-only { display: none; }
+"))
+
+tags$script(HTML("
+  function updateParticipantOnly(mode) {
+    if (mode === 'participant') {
+      $('.participant-only').show();
+      $('.symptom-dtw-only').hide();
+    } else {
+      $('.participant-only').hide();
+      $('.symptom-dtw-only').show();
+    }
+  }
+
+  $(document).on('shiny:connected', function() {
+    var mode = Shiny.shinyapp.$inputValues['mode'];
+    updateParticipantOnly(mode);
+  });
+
+  $(document).on('shiny:inputchanged', function(event) {
+    if (event.name === 'mode') {
+      updateParticipantOnly(event.value);
+    }
+  });
+
+  function placePredictionSections() {
+    var predictionTab = $('#section-prediction-explorer');
+    var comparisonSections = $('#section-available-results, #section-model-comparison');
+
+    if (predictionTab.length && comparisonSections.length) {
+      comparisonSections.appendTo(predictionTab);
+    }
+  }
+
+  // Run after parsing, then once more after all tab-pane setup is complete.
+  $(document).ready(placePredictionSections);
+  $(window).on('load', placePredictionSections);
+"))
+```
+
+```{r available-results-reactive, echo=FALSE}
+
+# Keep an unfiltered version so the exclusion selector always knows which
+# participants exist for the currently selected prediction model.
+raw_available_results <- reactive({
+  req(input$model)
+
+  if (identical(input$model, ENSEMBLE_MODEL_NAME)) {
+    get_ensemble_available_results()
+  } else {
+    get_available_results(input$model)
+  }
+})
+
+```
+
+```{r participant-exclusion-selector, echo=FALSE}
+
+renderUI({
+
+  results <- raw_available_results()
+
+  participants <- sort(
+    unique(results$participant_id)
+  )
+
+  req(length(participants) > 0)
+
+  selectizeInput(
+    inputId = "exclude_participants",
+    label = "Exclude participants:",
+    choices = participants,
+    selected = c("00011","00092"),
+    multiple = TRUE,
+    options = list(
+      plugins = list("remove_button"),
+      placeholder = "None"
+    )
+  )
+})
+
+```
+
+```{r excluded-participants-reactive, echo=FALSE}
+
+# Normalize IDs so values such as "00092" from the .pth filenames match
+# participant 92 in model_and_baseline_results.csv.
+normalize_participant_id <- function(x) {
+  x <- as.character(x)
+  suppressWarnings(
+    ifelse(
+      is.na(as.integer(x)),
+      x,
+      as.character(as.integer(x))
+    )
+  )
+}
+
+excluded_participants <- reactive({
+  if (is.null(input$exclude_participants)) {
+    return(character())
+  }
+  normalize_participant_id(input$exclude_participants)
+})
+
+available_results <- reactive({
+
+  results <- raw_available_results()
+  excluded <- excluded_participants()
+
+  if (length(excluded) == 0) {
+    return(results)
+  }
+
+  results %>%
+    filter(
+      !normalize_participant_id(participant_id) %in% excluded
+    )
+})
+
+```
+
+```{r participant-selector, echo=FALSE}
+
+renderUI({
+  
+  req(
+    input$mode == "participant"
+  )
+  
+  
+  results <- available_results()
+  
+  
+  participants <- unique(
+    results$participant_id
+  )
+  
+  
+  req(
+    length(participants) > 0
+  )
+
+  selectInput(
+    
+    inputId = "participant",
+    
+    label = "Participant:",
+    
+    choices = participants,
+    
+    selected = participants[1]
+  )
+  
+})
+
+```
+
+```{r symptom-selector, echo=FALSE}
+
+renderUI({
+  
+  req(
+    input$mode == "symptom"
+  )
+  
+  
+  results <- available_results()
+  
+  
+  available_symptoms <- unique(
+    results$outcome
+  )
+  
+  
+  symptom_choices <- c(
+    "Negative" = "negative",
+    "Cognitive" = "cognitive",
+    "Positive" = "positive"
+  )
+  
+  
+  symptom_choices <- symptom_choices[
+    symptom_choices %in%
+      available_symptoms
+  ]
+  
+  
+  req(
+    length(symptom_choices) > 0
+  )
+  
+  
+  selectInput(
+    
+    inputId = "symptom",
+    
+    label = "Symptom:",
+    
+    choices = symptom_choices,
+    
+    selected = unname(
+      symptom_choices[1]
+    )
+  )
+  
+})
+
+```
+
+```{r selected-data, echo=FALSE}
+
+selected_result_files <- reactive({
+  
+  req(
+    input$model,
+    input$mode
+  )
+  
+  
+  results <- available_results()
+  
+  
+  # ===========================================================================
+  # Participant mode
+  # ===========================================================================
+  
+  if (
+    input$mode == "participant"
+  ) {
+    
+    req(
+      input$participant
+    )
+    
+    
+    selected_files <- results %>%
+      
+      filter(
+        participant_id ==
+          input$participant
+      )
+    
+  }
+  
+  
+  # ===========================================================================
+  # Symptom mode
+  # ===========================================================================
+  
+  else {
+    
+    req(
+      input$symptom
+    )
+    
+    
+    selected_files <- results %>%
+      
+      filter(
+        outcome ==
+          input$symptom
+      )
+  }
+  
+  
+  req(
+    nrow(selected_files) > 0
+  )
+
+  selected_files
+  
+})
+
+selected_raw_prediction_rows <- reactive({
+  
+  pred_df <- load_selected_results(
+    selected_result_files(),
+    similarity_top_k = if (is_similarity_transfer_model(input$model)) {
+      similarity_transfer_top_k()
+    } else {
+      NULL
+    }
+  )
+  
+  req(
+    nrow(pred_df) > 0
+  )
+
+  if (identical(input$model, ENSEMBLE_MODEL_NAME)) {
+    pred_df <- make_mean_ensemble(pred_df)
+  }
+
+  pred_df
+  
+})
+
+
+selected_prediction_rows <- reactive({
+
+  pred_df <- selected_raw_prediction_rows()
+
+  if (is_checkpoint_transfer_model(input$model)) {
+    pred_df <- make_checkpoint_transfer_blend(
+      prediction_rows = pred_df,
+      personal_weight = checkpoint_transfer_personal_weight()
+    )
+  }
+
+  pred_df
+
+})
+
+selected_predictions <- reactive({
+  
+  selected_prediction_rows() %>%
+    
+    filter(
+      split == "test"
+    ) %>%
+    
+    group_by(
+      participant_id,
+      outcome
+    ) %>%
+    
+    arrange(
+      outer_i,
+      point_i,
+      .by_group = TRUE
+    ) %>%
+    
+    mutate(
+      observation = row_number()
+    ) %>%
+    
+    ungroup()
+  
+})
+
+
+```
+
+### True vs. Predicted
+
+```{r plot, echo=FALSE}
+
+renderPlot({
+  
+  pred_df <- selected_predictions()
+  
+  
+  plot_df <- pred_df %>%
+    
+    pivot_longer(
+      
+      cols = c(
+        y_true,
+        y_pred
+      ),
+      
+      names_to = "type",
+      values_to = "value"
+      
+    ) %>%
+    
+    mutate(
+      
+      type = recode(
+        type,
+        y_true = "True",
+        y_pred = "Predicted"
+      ),
+      
+      type = factor(
+        type,
+        levels = c(
+          "True",
+          "Predicted"
+        )
+      ),
+      
+      outcome_label = recode(
+        outcome,
+        negative = "Negative",
+        cognitive = "Cognitive",
+        positive = "Positive"
+      )
+    )
+  
+  
+  # ===========================================================================
+  # PARTICIPANT
+  # ===========================================================================
+  
+  if (
+    input$mode == "participant"
+  ) {
+    
+    ggplot(
+      
+      plot_df,
+      
+      aes(
+        x = observation,
+        y = value,
+        color = type,
+        group = type
+      )
+      
+    ) +
+      
+      geom_line(
+        linewidth = 1.15,
+        alpha = 0.95
+      ) +
+      
+      facet_wrap(
+        ~ outcome_label,
+        ncol = 1
+      ) +
+      
+      scale_color_manual(
+        values = c(
+          "True" = TRUE_COLOR,
+          "Predicted" = PRED_COLOR
+        )
+      ) +
+      
+      scale_y_continuous(
+        limits = c(0, 1),
+        breaks = seq(0, 1, by = 0.2),
+        expand = c(0, 0)
+      ) +
+      
+      labs(
+        title = paste0(
+          "Participant ",
+          input$participant
+        ),
+        subtitle = paste0(
+          input$model,
+          "  |  True vs. predicted symptom scores"
+        ),
+        x = "Test observation",
+        y = "Symptom score",
+        color = NULL
+      ) +
+      
+      theme_ipsum(
+        base_size = 13,
+        grid = "Y"
+      ) +
+      
+      theme(
+        legend.position = "top",
+        legend.text = element_text(face = "bold"),
+        plot.title = element_text(face = "bold", size = 18),
+        plot.subtitle = element_text(size = 10),
+        strip.text = element_text(face = "bold", size = 12),
+        axis.title.x = element_text(face = "bold"),
+        axis.title.y = element_text(face = "bold")
+      )
+  }
+  
+  
+  # ===========================================================================
+  # SYMPTOM
+  # ===========================================================================
+  
+  else {
+    
+    # -------------------------------------------------------------------------
+    # Correlation and significance for each participant
+    # -------------------------------------------------------------------------
+    
+    facet_stats <- pred_df %>%
+      group_by(
+        participant_id
+      ) %>%
+      group_modify(
+        ~ safe_cor_test(
+          .x$y_true,
+          .x$y_pred,
+          method = input$correlation_method
+        )
+      ) %>%
+      ungroup() %>%
+      mutate(
+        sig = case_when(
+          is.na(p) ~ "",
+          p < 0.001 ~ "***",
+          p < 0.01 ~ "**",
+          p < 0.05 ~ "*",
+          TRUE ~ "ns"
+        ),
+        p_label = case_when(
+          is.na(p) ~ "p = NA",
+          p < 0.001 ~ "p < .001",
+          TRUE ~ paste0(
+            "p = ",
+            sub(
+              "^0",
+              "",
+              sprintf(
+                "%.3f",
+                p
+              )
+            )
+          )
+        ),
+        corr_symbol = ifelse(
+          input$correlation_method == "spearman",
+          "rho",
+          "r"
+        ),
+        r_label = ifelse(
+          is.na(r),
+          paste0(corr_symbol, " = NA"),
+          paste0(
+            corr_symbol, " = ",
+            sub(
+              "^(-?)0\\.",
+              "\\1.",
+              sprintf(
+                "%.2f",
+                r
+              )
+            )
+          )
+        ),
+        facet_label = paste0(
+          "Participant ",
+          as.integer(participant_id),
+          " | ",
+          r_label,
+          ", ",
+          p_label,
+          ifelse(
+            sig == "",
+            "",
+            paste0(
+              " ",
+              sig
+            )
+          )
+        )
+      )
+    
+    plot_df <- plot_df %>%
+      left_join(
+        facet_stats %>%
+          select(
+            participant_id,
+            facet_label
+          ),
+        by = "participant_id"
+      )
+    
+    ggplot(
+      
+      plot_df,
+      
+      aes(
+        x = observation,
+        y = value,
+        color = type,
+        group = type
+      )
+      
+    ) +
+      
+      geom_line(
+        linewidth = 1,
+        alpha = 0.95
+      ) +
+      
+      facet_wrap(
+        ~ facet_label,
+        ncol = 3,
+        scales = "free_x"
+      ) +
+      
+      scale_color_manual(
+        values = c(
+          "True" = TRUE_COLOR,
+          "Predicted" = PRED_COLOR
+        )
+      ) +
+      
+      scale_y_continuous(
+        limits = c(0, 1),
+        breaks = seq(0, 1, by = 0.2),
+        expand = c(0, 0)
+      ) +
+      
+      labs(
+        title = paste0(
+          tools::toTitleCase(
+            input$symptom
+          ),
+          " symptoms"
+        ),
+        subtitle = paste0(
+          input$model,
+          "  |  True vs. predicted scores  |  * p < .05, ** p < .01, *** p < .001"
+        ),
+        x = "Test observation",
+        y = "Symptom score",
+        color = NULL
+      ) +
+      
+      theme_ipsum(
+        base_size = 12,
+        grid = "Y"
+      ) +
+      
+      theme(
+        legend.position = "top",
+        legend.text = element_text(face = "bold"),
+        plot.title = element_text(face = "bold", size = 18),
+        plot.subtitle = element_text(size = 10),
+        strip.text = element_text(face = "bold", size = 11),
+        axis.title.x = element_text(face = "bold"),
+        axis.title.y = element_text(face = "bold")
+      )
+  }
+  
+},
+height = 1000
+)
+
+```
+
+::: {.participant-only}
+
+### Participant Pointwise Performance
+
+```{r participant-performance, echo=FALSE}
+
+renderTable({
+  
+  req(
+    input$mode == "participant"
+  )
+  
+  
+  pred_df <- selected_predictions()
+  
+  
+  pred_df %>%
+    
+    group_by(
+      outcome
+    ) %>%
+    
+    summarise(
+      
+      N = sum(
+        complete.cases(
+          y_true,
+          y_pred
+        )
+      ),
+      
+      `Pearson r` = safe_cor(
+        y_true,
+        y_pred,
+        method = "pearson"
+      ),
+
+      `Spearman rho` = safe_cor(
+        y_true,
+        y_pred,
+        method = "spearman"
+      ),
+
+      `R²` = safe_r2(
+        y_true,
+        y_pred
+      ),
+
+      MAE = safe_mae(
+        y_true,
+        y_pred
+      ),
+
+      RMSE = safe_rmse(
+        y_true,
+        y_pred
+      ),
+      
+      .groups = "drop"
+      
+    ) %>%
+    
+    mutate(
+      
+      Symptom = outcome_label(
+        outcome
+      )
+    ) %>%
+    mutate(
+      across(
+        c(
+          `Pearson r`,
+          `Spearman rho`,
+          `R²`,
+          MAE,
+          RMSE
+        ),
+        ~ round(.x, 3)
+      )
+    ) %>%
+    select(
+      Symptom,
+      N,
+      `Pearson r`,
+      `Spearman rho`,
+      `R²`,
+      MAE,
+      RMSE
+    )
+  
+},
+digits = 3,
+striped = TRUE,
+hover = TRUE,
+spacing = "s"
+)
+
+```
+
+:::
+
+## Dynamic Time Warping
+
+Select a participant for detailed bounded-DTW results, or select a symptom for a cached overview across participants.
+
+::: {.participant-only}
+
+The shaded region shows the permutation-null mean ± 2 SD. The dashed line represents the relevant 5th or 95th percentile of the permutation distribution.
+
+```{r dtw-data, echo=FALSE}
+
+dtw_results <- reactive({
+  
+  req(
+    input$mode == "participant"
+  )
+
+  selected_files <- selected_result_files()
+
+  cache_context <- dtw_cache_context(
+    selected_files = selected_files,
+    model = input$model,
+    participant_id = input$participant,
+    correlation_method = input$correlation_method,
+    n_perm = N_PERM,
+    warping_radii = DTW_WARPING_RADII,
+    seed = DTW_SEED,
+    checkpoint_transfer_personal_weight = if (
+      is_checkpoint_transfer_model(input$model) &&
+        checkpoint_transfer_personal_weight() != 0.60
+    ) {
+      checkpoint_transfer_personal_weight()
+    } else {
+      NULL
+    },
+    similarity_transfer_top_k = if (is_similarity_transfer_model(input$model)) {
+      similarity_transfer_top_k()
+    } else {
+      NULL
+    }
+  )
+
+  cached_results <- read_dtw_cache(
+    DTW_CACHE_DIR,
+    cache_context
+  )
+
+  if (!is.null(cached_results)) {
+    return(prepare_dtw_display_results(cached_results))
+  }
+  
+  
+  pred_df <- selected_prediction_rows()
+  
+  
+  outcomes <- unique(
+    pred_df$outcome
+  )
+  
+  
+  results <- vector(
+    "list",
+    length(outcomes)
+  )
+  
+  
+  for (
+    i in seq_along(
+      outcomes
+    )
+  ) {
+    
+    current_outcome <- outcomes[i]
+    
+    
+    symptom_df_all <- pred_df %>%
+      
+      filter(
+        outcome ==
+          current_outcome
+      )
+
+    symptom_df_test <- symptom_df_all %>%
+      filter(
+        split == "test"
+      )
+    
+    
+    sweep <- get_dtw_for_symptom(
+      symptom_df_test,
+      correlation_method = input$correlation_method
+    )
+
+    effective_idx <- which(
+      sweep$d_real <
+        sweep$null_p05
+    )[1]
+
+    pointwise_idx <- which(
+      sweep$warping_radius_label == "0"
+    )[1]
+
+    sweep$outcome <-
+      current_outcome
+
+    sweep$pointwise_distance <-
+      if (
+        length(pointwise_idx) == 1
+      ) {
+        sweep$d_real[pointwise_idx]
+      } else {
+        NA_real_
+      }
+
+    sweep$effective_warping_index <-
+      if (
+        length(effective_idx) == 1
+      ) {
+        sweep$warping_radius_index[effective_idx]
+      } else {
+        NA_real_
+      }
+
+    sweep$effective_warping_label <-
+      if (
+        length(effective_idx) == 1
+      ) {
+        sweep$warping_radius_label[effective_idx]
+      } else {
+        "None"
+      }
+
+    sweep$effective_dtw_distance <-
+      if (
+        length(effective_idx) == 1
+      ) {
+        sweep$d_real[effective_idx]
+      } else {
+        NA_real_
+      }
+
+    sweep$effective_dtw_p_value <-
+      if (
+        length(effective_idx) == 1
+      ) {
+        sweep$null_p_value[effective_idx]
+      } else {
+        NA_real_
+      }
+
+    results[[i]] <- sweep
+  }
+  
+  
+  dtw_df <- bind_rows(
+    results
+  ) %>%
+    
+    mutate(
+      
+      Symptom = outcome_label(
+        outcome
+      ),
+      
+      Symptom = factor(
+        Symptom,
+        levels = c(
+          "Negative",
+          "Cognitive",
+          "Positive"
+        )
+      )
+    )
+
+  write_dtw_cache(
+    DTW_CACHE_DIR,
+    cache_context,
+    dtw_df
+  )
+
+  prepare_dtw_display_results(dtw_df)
+  
+})
+
+```
+
+### DTW Distance
+
+```{r dtw-distance-plot, echo=FALSE}
+
+renderPlot({
+  
+  req(
+    input$mode == "participant"
+  )
+  
+  
+  dtw_df <- dtw_results()
+  
+  
+  ggplot(
+    
+    dtw_df,
+    
+    aes(
+      x = warping_radius_index
+    )
+    
+  ) +
+    
+    geom_ribbon(
+      
+      aes(
+        ymin =
+          null_mean -
+          2 * null_sd,
+        
+        ymax =
+          null_mean +
+          2 * null_sd
+      ),
+      
+      fill = NULL_COLOR,
+      alpha = 0.18
+    ) +
+    
+    geom_line(
+      
+      aes(
+        y = null_p05
+      ),
+      
+      color = NULL_COLOR,
+      linetype = "dashed",
+      linewidth = 0.8,
+      alpha = 0.8
+    ) +
+    
+    geom_line(
+      
+      aes(
+        y = d_real
+      ),
+      
+      color = DTW_COLOR,
+      linewidth = 1.2
+    ) +
+
+    geom_vline(
+      
+      data = dtw_df %>%
+        filter(
+          is.finite(
+            effective_warping_index
+          )
+        ) %>%
+        group_by(Symptom) %>%
+        slice(1) %>%
+        ungroup(),
+      
+      aes(
+        xintercept =
+          effective_warping_index
+      ),
+      
+      color = PRED_COLOR,
+      linetype = "dotted",
+      linewidth = 0.8,
+      alpha = 0.9,
+      inherit.aes = FALSE
+    ) +
+    
+    geom_point(
+      
+      aes(
+        y = d_real
+      ),
+      
+      color = DTW_COLOR,
+      size = 2.5
+    ) +
+    
+    facet_wrap(
+      ~ Symptom,
+      ncol = 1
+    ) +
+    
+    scale_x_continuous(
+      
+      breaks = unique(
+        dtw_df$warping_radius_index
+      ),
+      labels = unique(
+        dtw_df$warping_radius_label
+      )
+    ) +
+    
+    labs(
+      
+      title = "Bounded DTW distance",
+      
+      subtitle =
+        "Lower values indicate a closer alignment; grey band = permutation null mean ± 2 SD; dotted line = smallest radius beating the permutation null",
+      
+      x = "Warping radius",
+      
+      y = "DTW distance"
+    ) +
+    
+    theme_ipsum(
+      base_size = 12,
+      grid = "Y"
+    ) +
+    
+    theme(
+      
+      plot.title = element_text(
+        face = "bold",
+        size = 17
+      ),
+      
+      strip.text = element_text(
+        face = "bold"
+      ),
+      
+      axis.title.x = element_text(
+        face = "bold"
+      ),
+      
+      axis.title.y = element_text(
+        face = "bold"
+      )
+    )
+  
+},
+height = 700
+)
+
+```
+
+### Correlation After DTW Alignment
+
+```{r dtw-correlation-plot, echo=FALSE}
+
+renderPlot({
+  
+  req(
+    input$mode == "participant"
+  )
+  
+  
+  dtw_df <- dtw_results()
+  
+  
+  ggplot(
+    
+    dtw_df,
+    
+    aes(
+      x = warping_radius_index
+    )
+    
+  ) +
+    
+    geom_ribbon(
+      
+      aes(
+        ymin =
+          corr_null_mean -
+          2 * corr_null_sd,
+        
+        ymax =
+          corr_null_mean +
+          2 * corr_null_sd
+      ),
+      
+      fill = NULL_COLOR,
+      alpha = 0.18
+    ) +
+    
+    geom_line(
+      
+      aes(
+        y = corr_null_p95
+      ),
+      
+      color = NULL_COLOR,
+      linetype = "dashed",
+      linewidth = 0.8,
+      alpha = 0.8
+    ) +
+    
+    geom_hline(
+      
+      data = dtw_df %>%
+        group_by(
+          Symptom
+        ) %>%
+        slice(1),
+      
+      aes(
+        yintercept =
+          corr_raw
+      ),
+      
+      color = NULL_COLOR,
+      linetype = "dotted",
+      linewidth = 0.9
+    ) +
+    
+    geom_line(
+      
+      aes(
+        y = corr_aligned
+      ),
+      
+      color = DTW_COLOR,
+      linewidth = 1.2
+    ) +
+    
+    geom_point(
+      
+      aes(
+        y = corr_aligned
+      ),
+      
+      color = DTW_COLOR,
+      size = 2.5
+    ) +
+    
+    facet_wrap(
+      ~ Symptom,
+      ncol = 1
+    ) +
+    
+    scale_x_continuous(
+      
+      breaks = unique(
+        dtw_df$warping_radius_index
+      ),
+      labels = unique(
+        dtw_df$warping_radius_label
+      )
+    ) +
+    
+    scale_y_continuous(
+      limits = c(
+        -1,
+        1
+      ),
+      breaks = seq(
+        -1,
+        1,
+        by = 0.25
+      )
+    ) +
+    
+    labs(
+      
+      title =
+        "Correlation after DTW alignment",
+      
+      subtitle =
+        "Dotted line = raw correlation; grey band = permutation null mean ± 2 SD",
+      
+      x =
+        "Warping radius",
+      
+      y = ifelse(
+        input$correlation_method == "spearman",
+        "Spearman rank correlation along DTW path",
+        "Pearson correlation along DTW path"
+      )
+    ) +
+    
+    theme_ipsum(
+      base_size = 12,
+      grid = "Y"
+    ) +
+    
+    theme(
+      
+      plot.title = element_text(
+        face = "bold",
+        size = 17
+      ),
+      
+      strip.text = element_text(
+        face = "bold"
+      ),
+      
+      axis.title.x = element_text(
+        face = "bold"
+      ),
+      
+      axis.title.y = element_text(
+        face = "bold"
+      )
+    )
+  
+},
+height = 700
+)
+
+```
+
+### DTW Summary
+
+```{r dtw-summary, echo=FALSE}
+
+renderTable({
+  
+  req(
+    input$mode == "participant"
+  )
+  
+  
+  dtw_df <- dtw_results()
+  
+  summary_df <- dtw_df %>%
+    group_by(
+      Symptom
+    ) %>%
+    slice(1) %>%
+    ungroup() %>%
+    mutate(
+      time_shift_result = case_when(
+        is.na(effective_warping_label) | effective_warping_label == "None" ~
+          "No time shift was clearly better than random",
+        effective_warping_label == "Inf" ~
+          "Unrestricted time shifting needed",
+        TRUE ~
+          paste0("Up to ", effective_warping_label, " time steps")
+      )
+    ) %>%
+    
+    transmute(
+      
+      Symptom,
+      
+      `Raw correlation` =
+        round(
+          corr_raw,
+          3
+        ),
+      
+      `Pointwise distance (w = 0)` =
+        round(
+          pointwise_distance,
+          4
+        ),
+      
+      `Time-shift result` =
+        time_shift_result,
+      
+      `Bounded DTW distance` =
+        if_else(
+          is.na(effective_dtw_distance),
+          "Not applicable",
+          formatC(effective_dtw_distance, format = "f", digits = 4)
+        ),
+      
+      `Bounded DTW permutation p` =
+        if_else(
+          is.na(effective_dtw_p_value),
+          "Not applicable",
+          formatC(effective_dtw_p_value, format = "f", digits = 3)
+        )
+    )
+  
+  
+  summary_df
+  
+},
+digits = 4,
+striped = TRUE,
+hover = TRUE,
+spacing = "s"
+)
+
+```
+
+The time-shift result asks: “Does allowing the prediction to move in time make it more similar to the real symptom pattern than random predictions?” “Unrestricted” means only the most flexible setting passed that check. “No time shift was clearly better than random” means none of the tested settings passed it.
+
+:::
+
+::: {.symptom-dtw-only}
+
+### Symptom Overview
+
+This overview uses precomputed DTW cache files for the currently selected model, symptom, and correlation type. Run `Rscript precompute_dtw_cache.R` first to populate missing participant results.
+
+```{r dtw-symptom-overview-data, echo=FALSE}
+
+dtw_symptom_overview <- reactive({
+
+  req(input$mode == "symptom", input$symptom)
+
+  result_files <- available_results()
+  participants <- unique(result_files$participant_id)
+
+  bind_rows(lapply(participants, function(current_participant) {
+    participant_files <- result_files %>%
+      filter(participant_id == current_participant)
+
+    cache_context <- dtw_cache_context(
+      selected_files = participant_files,
+      model = input$model,
+      participant_id = current_participant,
+      correlation_method = input$correlation_method,
+      n_perm = N_PERM,
+      warping_radii = DTW_WARPING_RADII,
+      seed = DTW_SEED,
+      checkpoint_transfer_personal_weight = if (
+        is_checkpoint_transfer_model(input$model) &&
+          checkpoint_transfer_personal_weight() != 0.60
+      ) {
+        checkpoint_transfer_personal_weight()
+      } else {
+        NULL
+      },
+      similarity_transfer_top_k = if (is_similarity_transfer_model(input$model)) {
+        similarity_transfer_top_k()
+      } else {
+        NULL
+      }
+    )
+
+    cached_results <- read_dtw_cache(DTW_CACHE_DIR, cache_context)
+
+    if (is.null(cached_results)) {
+      return(tibble(
+        participant_id = current_participant,
+        cache_available = FALSE
+      ))
+    }
+
+    prepare_dtw_display_results(cached_results) %>%
+      filter(outcome == input$symptom) %>%
+      slice(1) %>%
+      mutate(
+        participant_id = current_participant,
+        cache_available = TRUE,
+        time_shift_result = case_when(
+          is.na(effective_warping_label) | effective_warping_label == "None" ~
+            "No time shift was clearly better than random",
+          effective_warping_label == "Inf" ~
+            "Unrestricted time shifting needed",
+          TRUE ~
+            paste0("Up to ", effective_warping_label, " time steps")
+        )
+      )
+  }))
+})
+
+```
+
+```{r dtw-symptom-overview-status, echo=FALSE}
+
+renderText({
+
+  overview <- dtw_symptom_overview()
+  total <- nrow(overview)
+  cached <- sum(overview$cache_available)
+
+  paste0(
+    cached,
+    " of ",
+    total,
+    " selected participants have a matching cached DTW result."
+  )
+
+})
+
+```
+
+```{r dtw-symptom-overview-table, echo=FALSE}
+
+renderTable({
+
+  cached_overview <- dtw_symptom_overview() %>%
+    filter(cache_available)
+
+  req(nrow(cached_overview) > 0)
+
+  most_common <- cached_overview %>%
+    count(time_shift_result, name = "participants") %>%
+    arrange(desc(participants), time_shift_result) %>%
+    slice(1)
+
+  tibble(
+    Symptom = outcome_label(input$symptom),
+    `Cached participants` = nrow(cached_overview),
+    `Median raw correlation` = round(median(cached_overview$corr_raw, na.rm = TRUE), 3),
+    `Median pointwise distance` = round(median(cached_overview$pointwise_distance, na.rm = TRUE), 4),
+    `Participants with an effective time shift` = sum(cached_overview$effective_warping_label != "None", na.rm = TRUE),
+    `Most common time-shift result` = most_common$time_shift_result
+  )
+
+}, striped = TRUE, hover = TRUE, spacing = "s")
+
+```
+
+```{r dtw-symptom-overview-plot, echo=FALSE}
+
+renderPlot({
+
+  cached_overview <- dtw_symptom_overview() %>%
+    filter(cache_available)
+
+  req(nrow(cached_overview) > 0)
+
+  plot_df <- cached_overview %>%
+    count(time_shift_result, name = "participants") %>%
+    arrange(participants)
+
+  ggplot(plot_df, aes(x = reorder(time_shift_result, participants), y = participants)) +
+    geom_col(fill = DTW_COLOR, width = 0.7) +
+    geom_text(
+      aes(label = participants),
+      hjust = -0.2,
+      fontface = "bold"
+    ) +
+    coord_flip(clip = "off") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+    labs(
+      title = paste0(outcome_label(input$symptom), ": effective time shifts"),
+      subtitle = "Each bar shows how many participants had that DTW result",
+      x = NULL,
+      y = "Participants"
+    ) +
+    theme_ipsum(base_size = 12, grid = "X") +
+    theme(
+      plot.title = element_text(face = "bold", size = 17),
+      axis.title.y = element_text(face = "bold")
+    )
+
+}, height = 450)
+
+```
+
+:::
+
+### Available Results
+
+```{r available-summary, echo=FALSE}
+
+renderText({
+  
+  results <- available_results()
+  
+  
+  paste0(
+    
+    model_display_name(input$model),
+    ": ",
+    
+    length(
+      unique(
+        results$participant_id
+      )
+    ),
+    
+    " participants | ",
+    
+    nrow(
+      results
+    ),
+    
+    " result files"
+  )
+  
+})
+
+```
+
+### Model Comparison
+
+The following plots use the participant-level performance measures stored in `model_and_baseline_results.csv`. The exploratory mean ensemble is calculated in the app from matching test predictions of the three main models; it is not written back to the CSV. In **Participant** mode, the participant-level plot follows the participant selected above. In **Symptom** mode, only aggregate results across participants are shown for the selected symptom; individual-participant results are hidden.
+
+```{r comparison-data, echo=FALSE}
+
+# =============================================================================
+# Load model/baseline summary results
+# =============================================================================
+
+COMPARISON_RESULTS_PATH <- file.path(
+  RESULTS_ROOT,
+  "model_and_baseline_results.csv"
+)
+
+comparison_results <- read.csv(
+  COMPARISON_RESULTS_PATH
+) %>%
+  mutate(
+    participant_id = as.character(participant_id),
+    target = recode(
+      tolower(target),
+      negative = "Negative",
+      cognitive = "Cognitive",
+      positive = "Positive"
+    ),
+    target = factor(
+      target,
+      levels = c(
+        "Negative",
+        "Cognitive",
+        "Positive"
+      )
+    ),
+    model = as.character(model),
+    result_source = as.character(result_source),
+    rmse = sqrt(
+      pmax(mse, 0)
+    )
+  ) %>%
+  filter(
+    result_source == "Baseline" |
+      model %in% MAIN_MODEL_DIRS
+  )
+
+
+# Calculate the ensemble performance from the exact same matched test rows used
+# for the ensemble prediction plots. Reactive caching avoids reloading the .pth
+# files while the user changes performance-measure controls.
+exploratory_ensemble_results <- reactive({
+
+  ensemble_files <- get_ensemble_available_results()
+
+  # Apply the app-wide exclusion before loading and aligning model outputs.
+  # Some in-progress participants have all three files but different test rows.
+  excluded <- excluded_participants()
+
+  if (length(excluded) > 0) {
+    ensemble_files <- ensemble_files %>%
+      filter(
+        !normalize_participant_id(participant_id) %in% excluded
+      )
+  }
+
+  if (nrow(ensemble_files) == 0) {
+    return(tibble())
+  }
+
+  ensemble_predictions <- make_mean_ensemble(
+    load_selected_results(ensemble_files)
+  )
+
+  ensemble_predictions %>%
+    filter(split == "test") %>%
+    group_by(
+      participant_id,
+      outcome
+    ) %>%
+    summarise(
+      n = sum(complete.cases(y_true, y_pred)),
+      corr = safe_cor(y_true, y_pred, method = "pearson"),
+      mse = safe_mse(y_true, y_pred),
+      mae = safe_mae(y_true, y_pred),
+      r2 = safe_r2(y_true, y_pred),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      participant_id = normalize_participant_id(participant_id),
+      target = factor(
+        outcome_label(outcome),
+        levels = c("Negative", "Cognitive", "Positive")
+      ),
+      model = ENSEMBLE_MODEL_NAME,
+      result_source = "Exploratory ensemble",
+      corr_p = NA_real_,
+      rmse = sqrt(pmax(mse, 0)),
+      # Match the text column type in model_and_baseline_results.csv.
+      complete = "True",
+      file_path = NA_character_,
+      load_error = NA_character_
+    ) %>%
+    select(-outcome)
+})
+
+
+# The checkpoint-transfer result files retain both component predictions, so
+# every exploratory transfer variant can follow the blend slider without model inference.
+checkpoint_transfer_prediction_components <- reactive({
+
+  if (length(CHECKPOINT_TRANSFER_COMPARISON_DIRS) == 0) {
+    return(tibble())
+  }
+
+  transfer_files <- bind_rows(
+    lapply(
+      CHECKPOINT_TRANSFER_COMPARISON_DIRS,
+      get_available_results
+    )
+  )
+  excluded <- excluded_participants()
+
+  if (length(excluded) > 0) {
+    transfer_files <- transfer_files %>%
+      filter(
+        !normalize_participant_id(participant_id) %in% excluded
+      )
+  }
+
+  if (nrow(transfer_files) == 0) {
+    return(tibble())
+  }
+
+  standard_transfer_files <- transfer_files %>%
+    filter(!is_similarity_transfer_model(model))
+  similarity_transfer_files <- transfer_files %>%
+    filter(is_similarity_transfer_model(model))
+
+  bind_rows(
+    if (nrow(standard_transfer_files) > 0) {
+      load_selected_results(standard_transfer_files)
+    },
+    if (nrow(similarity_transfer_files) > 0) {
+      load_selected_results(
+        similarity_transfer_files,
+        similarity_top_k = similarity_transfer_top_k()
+      )
+    }
+  )
+})
+
+
+exploratory_checkpoint_transfer_results <- reactive({
+
+  transfer_components <- checkpoint_transfer_prediction_components()
+
+  if (nrow(transfer_components) == 0) {
+    return(tibble())
+  }
+
+  transfer_predictions <- make_checkpoint_transfer_blend(
+    prediction_rows = transfer_components,
+    personal_weight = checkpoint_transfer_personal_weight()
+  )
+
+  transfer_predictions %>%
+    filter(split == "test") %>%
+    group_by(
+      participant_id,
+      outcome,
+      model
+    ) %>%
+    summarise(
+      n = sum(complete.cases(y_true, y_pred)),
+      corr = safe_cor(y_true, y_pred, method = "pearson"),
+      mse = safe_mse(y_true, y_pred),
+      mae = safe_mae(y_true, y_pred),
+      r2 = safe_r2(y_true, y_pred),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      participant_id = normalize_participant_id(participant_id),
+      target = factor(
+        outcome_label(outcome),
+        levels = c("Negative", "Cognitive", "Positive")
+      ),
+      result_source = "Exploratory checkpoint-transfer blend",
+      corr_p = NA_real_,
+      rmse = sqrt(pmax(mse, 0)),
+      complete = "True",
+      file_path = NA_character_,
+      load_error = NA_character_
+    ) %>%
+    select(-outcome)
+})
+
+
+comparison_results_filtered <- reactive({
+
+  excluded <- excluded_participants()
+
+  all_comparison_results <- comparison_results
+
+  # Reading every source prediction file is only needed when the user elects
+  # to include the exploratory ensemble in a performance comparison.
+  if (
+    !is.null(input$comparison_models) &&
+      ENSEMBLE_MODEL_NAME %in% input$comparison_models
+  ) {
+    all_comparison_results <- bind_rows(
+      all_comparison_results,
+      exploratory_ensemble_results()
+    )
+  }
+
+  if (
+    !is.null(input$comparison_models) &&
+      any(CHECKPOINT_TRANSFER_COMPARISON_NAMES %in% input$comparison_models)
+  ) {
+    all_comparison_results <- bind_rows(
+      all_comparison_results,
+      exploratory_checkpoint_transfer_results()
+    )
+  }
+
+  if (length(excluded) == 0) {
+    return(all_comparison_results)
+  }
+
+  all_comparison_results %>%
+    filter(
+      !normalize_participant_id(participant_id) %in% excluded
+    )
+})
+
+# =============================================================================
+# Model colors
+# =============================================================================
+
+MODEL_COLORS <- c(
+  "#F04E37",  # strong Aperol orange
+  "#FF9A6E",  # peach coral
+  "#D97A2B",  # burnt orange
+  "#F4B860",  # golden sand
+  "#EED9A0",  # pale sand
+  "#C9A45A",  # deeper sandy gold
+  "#A9DDF2",  # pale sky blue
+  "#89D0EA",  # light coastal blue
+  "#4C9BC8",  # medium coastal blue
+  "#2D6D98"   # deep ocean blue
+)
+
+
+comparison_model_names <- sort(
+  unique(c(
+    comparison_results$model,
+    ENSEMBLE_MODEL_NAME,
+    CHECKPOINT_TRANSFER_COMPARISON_NAMES
+  ))
+)
+
+comparison_default_model_names <- sort(
+  unique(c(
+    comparison_results$model
+  ))
+)
+
+comparison_model_colors <- setNames(
+  rep(
+    MODEL_COLORS,
+    length.out = length(comparison_model_names)
+  ),
+  comparison_model_names
+)
+
+# =============================================================================
+# Metric helpers
+# =============================================================================
+
+metric_labels <- c(
+  corr = "Pearson correlation",
+  mse = "Mean squared error",
+  mae = "Mean absolute error",
+  rmse = "Root mean squared error",
+  r2 = "R²"
+)
+
+metric_short_labels <- c(
+  corr = "r",
+  mse = "MSE",
+  mae = "MAE",
+  rmse = "RMSE",
+  r2 = "R²"
+)
+
+higher_is_better <- function(metric) {
+  metric %in% c("corr", "r2")
+}
+
+format_metric_value <- function(x, metric) {
+  ifelse(
+    is.na(x),
+    NA_character_,
+    if (metric == "corr") {
+      sprintf("%.2f", x)
+    } else if (metric == "r2") {
+      sprintf("%.2f", x)
+    } else {
+      sprintf("%.3f", x)
+    }
+  )
+}
+
+participant_model_wins <- function(data, metric, models, targets) {
+  participant_metrics <- data %>%
+    mutate(
+      target = as.character(target),
+      metric_value = .data[[metric]]
+    ) %>%
+    filter(
+      model %in% models,
+      target %in% targets,
+      is.finite(metric_value)
+    ) %>%
+    group_by(participant_id, target, model) %>%
+    summarise(
+      metric_value = mean(metric_value),
+      .groups = "drop"
+    )
+
+  eligible_metrics <- participant_metrics %>%
+    group_by(participant_id, target) %>%
+    filter(n_distinct(model) == length(models)) %>%
+    ungroup()
+
+  winners <- if (higher_is_better(metric)) {
+    eligible_metrics %>%
+      group_by(participant_id, target) %>%
+      filter(metric_value == max(metric_value)) %>%
+      ungroup()
+  } else {
+    eligible_metrics %>%
+      group_by(participant_id, target) %>%
+      filter(metric_value == min(metric_value)) %>%
+      ungroup()
+  }
+
+  win_counts <- winners %>%
+    count(target, model, name = "participant_wins")
+
+  participant_counts <- eligible_metrics %>%
+    distinct(participant_id, target) %>%
+    count(target, name = "participants_compared")
+
+  tidyr::expand_grid(
+    target = targets,
+    model = models
+  ) %>%
+    left_join(win_counts, by = c("target", "model")) %>%
+    left_join(participant_counts, by = "target") %>%
+    mutate(
+      participant_wins = replace_na(participant_wins, 0L),
+      participants_compared = replace_na(participants_compared, 0L),
+      target = factor(
+        target,
+        levels = c("Negative", "Cognitive", "Positive")
+      ),
+      model = factor(model, levels = models)
+    )
+}
+
+# =============================================================================
+# Summary helper
+# =============================================================================
+
+summarise_metric <- function(data, metric, group_vars) {
+
+  metric_values <- data[[metric]]
+
+  data <- data %>%
+    mutate(.metric_value = metric_values) %>%
+    filter(is.finite(.metric_value))
+
+  data %>%
+    group_by(across(all_of(group_vars))) %>%
+    summarise(
+      n = n(),
+      n_participants = n_distinct(participant_id),
+      mean_value = mean(.metric_value, na.rm = TRUE),
+      sd_value = sd(.metric_value, na.rm = TRUE),
+      se_value = ifelse(n > 1, sd_value / sqrt(n), NA_real_),
+      lower = mean_value - se_value,
+      upper = mean_value + se_value,
+      median_value = median(.metric_value, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+
+summarise_metrics_for_table <- function(data, group_vars) {
+  bind_rows(lapply(names(metric_labels), function(metric) {
+    metric_summary <- summarise_metric(
+      data = data,
+      metric = metric,
+      group_vars = group_vars
+    )
+
+    metric_summary$mean_median <- paste0(
+      format_metric_value(metric_summary$mean_value, metric),
+      " (",
+      format_metric_value(metric_summary$median_value, metric),
+      ")"
+    )
+
+    metric_summary %>%
+      mutate(
+        metric = metric
+      ) %>%
+      select(
+        all_of(group_vars),
+        metric,
+        mean_median
+      )
+  })) %>%
+    pivot_wider(
+      names_from = metric,
+      values_from = mean_median
+    )
+}
+
+```
+
+#### Performance measure
+
+```{r comparison-metric-selector, echo=FALSE}
+
+selectInput(
+  inputId = "comparison_metric",
+  label = "Ranking and plot measure:",
+  choices = c(
+    "Pearson correlation" = "corr",
+    "Mean squared error (MSE)" = "mse",
+    "Mean absolute error (MAE)" = "mae",
+    "Root mean squared error (RMSE)" = "rmse",
+    "R²" = "r2"
+  ),
+  selected = "corr"
+)
+
+selectizeInput(
+  inputId = "comparison_models",
+  label = "Models / baselines to compare:",
+  choices = comparison_model_names,
+  selected = comparison_default_model_names,
+  multiple = TRUE,
+  options = list(
+    plugins = list("remove_button")
+  )
+)
+
+```
+
+::: {.participant-only}
+
+#### Participant-level model comparison
+
+The model comparison below automatically follows the participant selected in the main participant selector above. The last selected participant is remembered if you temporarily switch to symptom view.
+
+```{r comparison-selected-participant, echo=FALSE}
+
+comparison_selected_participant <- reactiveVal(NULL)
+
+observeEvent(
+  input$participant,
+  {
+    if (!is.null(input$participant) && nzchar(input$participant)) {
+      comparison_selected_participant(
+        as.character(as.integer(input$participant))
+      )
+    }
+  },
+  ignoreInit = FALSE
+)
+
+```
+
+```{r participant-model-comparison, echo=FALSE}
+
+renderPlot({
+
+  req(
+    input$mode == "participant"
+  )
+
+  comparison_participant <- comparison_selected_participant()
+
+  req(
+    !is.null(comparison_participant),
+    input$comparison_metric,
+    input$comparison_models
+  )
+
+  metric <- input$comparison_metric
+
+  participant_df <- comparison_results_filtered() %>%
+    filter(
+      participant_id == comparison_participant,
+      model %in% input$comparison_models,
+      is.finite(.data[[metric]])
+    ) %>%
+    mutate(
+      metric_value = .data[[metric]],
+      value_label = format_metric_value(
+        .data[[metric]],
+        metric
+      )
+    )
+
+  validate(
+    need(
+      nrow(participant_df) > 0,
+      paste0(
+        "No ",
+        metric_labels[[metric]],
+        " results found for participant ",
+        comparison_participant,
+        "."
+      )
+    )
+  )
+
+  y_min <- min(
+    0,
+    participant_df$metric_value,
+    na.rm = TRUE
+  )
+
+  y_max <- max(
+    0,
+    participant_df$metric_value,
+    na.rm = TRUE
+  )
+
+  y_span <- max(
+    y_max - y_min,
+    abs(y_max) * 0.15,
+    abs(y_min) * 0.15,
+    0.10
+  )
+
+  ggplot(
+    participant_df,
+    aes(
+      x = model,
+      y = metric_value,
+      fill = model
+    )
+  ) +
+    geom_col(
+      width = 0.72
+    ) +
+    geom_text(
+      aes(
+        label = value_label,
+        y = ifelse(
+          metric_value >= 0,
+          metric_value - 0.06 * y_span,
+          metric_value + 0.06 * y_span
+        ),
+        vjust = ifelse(
+          metric_value >= 0,
+          1,
+          0
+        )
+      ),
+      color = "white",
+      fontface = "bold",
+      size = 3.8,
+      show.legend = FALSE
+    ) +
+    geom_hline(
+      yintercept = 0,
+      linewidth = 0.5
+    ) +
+    facet_wrap(
+      ~ target,
+      nrow = 1
+    ) +
+    scale_fill_manual(
+      values = comparison_model_colors,
+      drop = FALSE
+    ) +
+    scale_y_continuous(
+      limits = c(
+        y_min - 0.10 * y_span,
+        y_max + 0.10 * y_span
+      ),
+      breaks = scales::breaks_pretty(n = 6),
+      expand = expansion(mult = c(0.02, 0.02))
+    ) +
+    labs(
+      title = paste0(
+        "Participant ",
+        comparison_participant
+      ),
+      subtitle = paste0(
+        metric_labels[[metric]],
+        " by model"
+      ),
+      x = NULL,
+      y = metric_labels[[metric]],
+      fill = "Model"
+    ) +
+    theme_ipsum(
+      base_size = 13,
+      grid = "Y"
+    ) +
+    theme(
+      legend.position = "top",
+      legend.title = element_text(
+        face = "bold"
+      ),
+      legend.text = element_text(
+        face = "bold"
+      ),
+      plot.title = element_text(
+        face = "bold",
+        size = 18
+      ),
+      plot.subtitle = element_text(
+        size = 10
+      ),
+      strip.text = element_text(
+        face = "bold",
+        size = 12
+      ),
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.title.y = element_text(
+        face = "bold"
+      )
+    )
+
+},
+height = 500
+)
+
+```
+
+:::
+
+#### Model performance across participants
+
+```{r overall-model-comparison, echo=FALSE}
+
+renderPlot({
+
+  req(
+    input$comparison_metric,
+    input$comparison_models
+  )
+
+  metric <- input$comparison_metric
+
+  comparison_plot_data <- comparison_results_filtered() %>%
+    filter(
+      model %in% input$comparison_models
+    )
+
+  if (
+    input$mode == "symptom"
+  ) {
+
+    req(input$symptom)
+
+    selected_target <- outcome_label(
+      input$symptom
+    )
+
+    comparison_plot_data <- comparison_plot_data %>%
+      filter(
+        as.character(target) == selected_target
+      )
+  }
+
+  overall_model_results <- summarise_metric(
+    comparison_plot_data,
+    metric = metric,
+    group_vars = c("model", "target")
+  ) %>%
+    mutate(
+      value_label = format_metric_value(
+        mean_value,
+        metric
+      )
+    )
+
+  validate(
+    need(
+      nrow(overall_model_results) > 0,
+      "No results available for this performance measure."
+    )
+  )
+
+  subtitle_text <- paste0(
+    "Mean participant-level ",
+    metric_short_labels[[metric]],
+    " ± SE"
+  )
+
+  ggplot(
+    overall_model_results,
+    aes(
+      x = model,
+      y = mean_value,
+      fill = model
+    )
+  ) +
+    geom_col(
+      width = 0.72
+    ) +
+    geom_errorbar(
+      aes(
+        ymin = lower,
+        ymax = upper
+      ),
+      width = 0.16,
+      linewidth = 0.6,
+      na.rm = TRUE
+    ) +
+    geom_text(
+      aes(
+        label = value_label,
+        y = ifelse(
+          mean_value >= 0,
+          ifelse(is.na(upper), mean_value, upper),
+          ifelse(is.na(lower), mean_value, lower)
+        ),
+        vjust = ifelse(
+          mean_value >= 0,
+          -0.55,
+          1.45
+        )
+      ),
+      fontface = "bold",
+      size = 3.8,
+      show.legend = FALSE
+    ) +
+    geom_hline(
+      yintercept = 0,
+      linewidth = 0.5
+    ) +
+    facet_wrap(
+      ~ target,
+      nrow = 1
+    ) +
+    scale_fill_manual(
+      values = comparison_model_colors,
+      drop = FALSE
+    ) +
+    scale_y_continuous(
+      breaks = scales::breaks_pretty(n = 6),
+      expand = expansion(mult = c(0.15, 0.22))
+    ) +
+    labs(
+      title = if (input$mode == "symptom") {
+        paste0(
+          outcome_label(input$symptom),
+          " symptoms: model performance across participants"
+        )
+      } else {
+        "Model performance across participants"
+      },
+      subtitle = subtitle_text,
+      x = NULL,
+      y = metric_labels[[metric]],
+      fill = "Model"
+    ) +
+    theme_ipsum(
+      base_size = 13,
+      grid = "Y"
+    ) +
+    theme(
+      legend.position = "top",
+      legend.title = element_text(
+        face = "bold"
+      ),
+      legend.text = element_text(
+        face = "bold"
+      ),
+      plot.title = element_text(
+        face = "bold",
+        size = 18
+      ),
+      plot.subtitle = element_text(
+        size = 10
+      ),
+      strip.text = element_text(
+        face = "bold",
+        size = 12
+      ),
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.title.y = element_text(
+        face = "bold"
+      )
+    )
+
+},
+height = 500
+)
+
+```
+
+#### Best model by participant
+
+For each symptom, this chart counts how often each selected model had the best result for an individual participant. A participant is included only when all selected models have a finite value for the chosen measure. Exact ties count for every tied model.
+
+```{r participant-best-model-frequency, echo=FALSE}
+
+renderPlot({
+
+  req(
+    input$comparison_metric,
+    input$comparison_models
+  )
+
+  metric <- input$comparison_metric
+  selected_targets <- if (input$mode == "symptom") {
+    req(input$symptom)
+    outcome_label(input$symptom)
+  } else {
+    c("Negative", "Cognitive", "Positive")
+  }
+
+  win_data <- participant_model_wins(
+    data = comparison_results_filtered(),
+    metric = metric,
+    models = input$comparison_models,
+    targets = selected_targets
+  )
+
+  validate(
+    need(
+      any(win_data$participants_compared > 0),
+      "No participants have finite results for every selected model and this performance measure."
+    )
+  )
+
+  direction_text <- if (higher_is_better(metric)) {
+    "highest value wins"
+  } else {
+    "lowest value wins"
+  }
+
+  ggplot(
+    win_data,
+    aes(
+      x = model,
+      y = participant_wins,
+      fill = model
+    )
+  ) +
+    geom_col(width = 0.72) +
+    geom_text(
+      aes(label = participant_wins),
+      vjust = -0.45,
+      fontface = "bold",
+      size = 3.8,
+      show.legend = FALSE
+    ) +
+    facet_wrap(~ target, nrow = 1) +
+    scale_fill_manual(
+      values = comparison_model_colors,
+      drop = FALSE
+    ) +
+    scale_y_continuous(
+      breaks = scales::breaks_pretty(n = 6),
+      expand = expansion(mult = c(0, 0.16))
+    ) +
+    labs(
+      title = "How often each model is best per participant",
+      subtitle = paste0(
+        metric_labels[[metric]], ": ", direction_text,
+        "; only complete participant-model comparisons are counted"
+      ),
+      x = NULL,
+      y = "Participants where model was best",
+      fill = "Model"
+    ) +
+    theme_ipsum(
+      base_size = 13,
+      grid = "Y"
+    ) +
+    theme(
+      legend.position = "top",
+      legend.title = element_text(face = "bold"),
+      legend.text = element_text(face = "bold"),
+      plot.title = element_text(face = "bold", size = 18),
+      plot.subtitle = element_text(size = 10),
+      strip.text = element_text(face = "bold", size = 12),
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.title.y = element_text(face = "bold")
+    )
+
+}, height = 500)
+
+```
+
+#### Overall Model Ranking
+
+In **Participant** mode, the overall ranking combines all available participant × symptom results. In **Symptom** mode, it ranks models using only the symptom selected above. The table shows both median and mean ranks and is ordered by median rank. Every measure is shown as `mean (median)`. Higher values indicate better performance for correlation and R²; lower values indicate better performance for MSE, MAE, and RMSE.
+
+```{r overall-model-ranking, echo=FALSE}
+
+overall_model_ranking_table <- reactive({
+
+  req(
+    input$comparison_metric,
+    input$comparison_models
+  )
+
+  metric <- input$comparison_metric
+
+  ranking_data <- comparison_results_filtered() %>%
+    filter(
+      model %in% input$comparison_models
+    )
+
+  if (
+    input$mode == "symptom"
+  ) {
+
+    req(input$symptom)
+
+    selected_target <- outcome_label(
+      input$symptom
+    )
+
+    ranking_data <- ranking_data %>%
+      filter(
+        as.character(target) == selected_target
+      )
+  }
+
+  ranking <- summarise_metric(
+    ranking_data,
+    metric = metric,
+    group_vars = c("model")
+  )
+
+  all_metric_summaries <- summarise_metrics_for_table(
+    ranking_data,
+    group_vars = c("model")
+  )
+
+  ranking %>%
+    mutate(
+      median_rank = if (higher_is_better(metric)) {
+        min_rank(desc(median_value))
+      } else {
+        min_rank(median_value)
+      },
+      mean_rank = if (higher_is_better(metric)) {
+        min_rank(desc(mean_value))
+      } else {
+        min_rank(mean_value)
+      }
+    ) %>%
+    arrange(
+      median_rank,
+      mean_rank,
+      model
+    ) %>%
+    left_join(
+      all_metric_summaries,
+      by = "model"
+    ) %>%
+    select(
+      `Median rank` = median_rank,
+      `Mean rank` = mean_rank,
+      Model = model,
+      `r mean (median)` = corr,
+      `MSE mean (median)` = mse,
+      `MAE mean (median)` = mae,
+      `RMSE mean (median)` = rmse,
+      `R² mean (median)` = r2,
+      `Participants` = n_participants,
+      `Participant × symptom results` = n
+    )
+
+})
+
+renderTable(
+  overall_model_ranking_table(),
+striped = TRUE,
+hover = TRUE,
+spacing = "s"
+)
+
+downloadButton(
+  "download_overall_model_ranking",
+  "Download overall ranking (.csv)"
+)
+
+output$download_overall_model_ranking <- downloadHandler(
+  filename = function() {
+    paste0(
+      "overall_model_ranking_",
+      input$comparison_metric,
+      ".csv"
+    )
+  },
+  content = function(file) {
+    write.csv(
+      overall_model_ranking_table(),
+      file,
+      row.names = FALSE,
+      na = ""
+    )
+  }
+)
+
+```
+
+
+
+#### Model Ranking by Symptom
+
+This table ranks models separately for Negative, Cognitive, and Positive symptoms. It shows both median and mean ranks and is ordered by median rank. Every measure is displayed as `mean (median)`. Higher values indicate better performance for correlation and R²; lower values indicate better performance for MSE, MAE, and RMSE.
+
+```{r model-ranking-by-symptom, echo=FALSE}
+
+model_ranking_by_symptom_table <- reactive({
+
+  req(
+    input$comparison_metric,
+    input$comparison_models
+  )
+
+  metric <- input$comparison_metric
+
+  symptom_ranking_data <- comparison_results_filtered() %>%
+    filter(
+      model %in% input$comparison_models
+    )
+
+  ranking_by_symptom <- summarise_metric(
+    symptom_ranking_data,
+    metric = metric,
+    group_vars = c("target", "model")
+  )
+
+  all_metric_summaries <- summarise_metrics_for_table(
+    symptom_ranking_data,
+    group_vars = c("target", "model")
+  )
+
+  ranking_by_symptom <- ranking_by_symptom %>%
+    group_by(target) %>%
+    mutate(
+      median_rank = if (higher_is_better(metric)) {
+        min_rank(desc(median_value))
+      } else {
+        min_rank(median_value)
+      },
+      mean_rank = if (higher_is_better(metric)) {
+        min_rank(desc(mean_value))
+      } else {
+        min_rank(mean_value)
+      }
+    ) %>%
+    ungroup()
+
+  ranking_by_symptom %>%
+    mutate(
+      Symptom = as.character(target)
+    ) %>%
+    left_join(
+      all_metric_summaries,
+      by = c("target", "model")
+    ) %>%
+    select(
+      Symptom,
+      `Median rank` = median_rank,
+      `Mean rank` = mean_rank,
+      Model = model,
+      `r mean (median)` = corr,
+      `MSE mean (median)` = mse,
+      `MAE mean (median)` = mae,
+      `RMSE mean (median)` = rmse,
+      `R² mean (median)` = r2,
+      Participants = n_participants
+    ) %>%
+    arrange(
+      factor(
+        Symptom,
+        levels = c("Negative", "Cognitive", "Positive")
+      ),
+      `Median rank`,
+      `Mean rank`,
+      Model
+    )
+
+})
+
+renderTable(
+  model_ranking_by_symptom_table(),
+striped = TRUE,
+hover = TRUE,
+spacing = "s"
+)
+
+downloadButton(
+  "download_model_ranking_by_symptom",
+  "Download ranking by symptom (.csv)"
+)
+
+output$download_model_ranking_by_symptom <- downloadHandler(
+  filename = function() {
+    paste0(
+      "model_ranking_by_symptom_",
+      input$comparison_metric,
+      ".csv"
+    )
+  },
+  content = function(file) {
+    write.csv(
+      model_ranking_by_symptom_table(),
+      file,
+      row.names = FALSE,
+      na = ""
+    )
+  }
+)
+
+```
+
+```{r best-model-by-symptom-summary, echo=FALSE}
+
+renderTable({
+
+  req(
+    input$comparison_metric,
+    input$comparison_models
+  )
+
+  metric <- input$comparison_metric
+
+  best_symptom_data <- comparison_results_filtered() %>%
+    filter(
+      model %in% input$comparison_models
+    )
+
+  best_by_symptom <- summarise_metric(
+    best_symptom_data,
+    metric = metric,
+    group_vars = c("target", "model")
+  )
+
+  if (higher_is_better(metric)) {
+
+    best_by_symptom <- best_by_symptom %>%
+      group_by(target) %>%
+      slice_max(
+        order_by = median_value,
+        n = 1,
+        with_ties = FALSE
+      ) %>%
+      ungroup()
+
+  } else {
+
+    best_by_symptom <- best_by_symptom %>%
+      group_by(target) %>%
+      slice_min(
+        order_by = median_value,
+        n = 1,
+        with_ties = FALSE
+      ) %>%
+      ungroup()
+  }
+
+  best_by_symptom %>%
+    mutate(
+      Symptom = as.character(target),
+      `Best model` = model,
+      `Median performance` = format_metric_value(
+        median_value,
+        metric
+      )
+    ) %>%
+    select(
+      Symptom,
+      `Best model`,
+      `Median performance`
+    ) %>%
+    arrange(
+      factor(
+        Symptom,
+        levels = c("Negative", "Cognitive", "Positive")
+      )
+    )
+
+},
+striped = TRUE,
+hover = TRUE,
+spacing = "s"
+)
+
+```
+
+```{r best-model-summary, echo=FALSE}
+
+renderText({
+
+  req(input$comparison_metric)
+
+  metric <- input$comparison_metric
+
+  ranking <- summarise_metric(
+    comparison_results_filtered(),
+    metric = metric,
+    group_vars = c("model")
+  )
+
+  req(nrow(ranking) > 0)
+
+  if (higher_is_better(metric)) {
+    median_best <- ranking %>% slice_max(median_value, n = 1, with_ties = FALSE)
+    mean_best <- ranking %>% slice_max(mean_value, n = 1, with_ties = FALSE)
+  } else {
+    median_best <- ranking %>% slice_min(median_value, n = 1, with_ties = FALSE)
+    mean_best <- ranking %>% slice_min(mean_value, n = 1, with_ties = FALSE)
+  }
+
+  direction_text <- if (
+    higher_is_better(metric)
+  ) {
+    "highest"
+  } else {
+    "lowest"
+  }
+
+  paste0(
+    "Best overall by median ",
+    metric_labels[[metric]],
+    ": ",
+    median_best$model,
+    " (",
+    direction_text,
+    " overall median = ",
+    format_metric_value(median_best$median_value, metric),
+    "). Best overall by mean: ",
+    mean_best$model,
+    " (",
+    direction_text,
+    " overall mean = ",
+    format_metric_value(mean_best$mean_value, metric),
+    ")."
+  )
+
+})
+
+```
