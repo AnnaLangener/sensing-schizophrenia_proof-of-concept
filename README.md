@@ -17,8 +17,7 @@ Research notebooks and R scripts for predicting negative, cognitive, and positiv
 | `precompute_dtw_cache.R` | Precomputes bounded dynamic time warping (DTW) comparisons and permutation-based summaries from held-out predictions. |
 | `create_main_paper_figures.R` | Generates performance-comparison and participant-trajectory figures. |
 | `Result_Explorer_App.Rmd` | Runs an interactive Shiny R Markdown result explorer with model comparisons, participant predictions, and DTW summaries. |
-| `models/` | Supporting Python modules for projection heads, ResNet time-series encoders, Llama, and analysis utilities used by exploratory work. |
-| `Old Notebooks/` | Historical experiments and earlier implementations. Start with the top-level notebooks listed above. |
+
 
 ## Environment and paths
 
