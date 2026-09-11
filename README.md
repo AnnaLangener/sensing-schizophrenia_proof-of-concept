@@ -2,7 +2,6 @@
 
 Research notebooks and R scripts for predicting negative, cognitive, and positive schizophrenia symptom scores from passive smartphone sensing and ecological momentary assessment (EMA). The workflow prepares participant data, fits individualized Chronos-2 models and baselines with rolling nested cross-validation, and compares held-out predictions.
 
-This directory is a notebook-based research workflow. Configuration lives inside individual notebooks and scripts; there is no shared environment lockfile or single pipeline command. Paths below are relative to the `SensingIndividualized` project root unless stated otherwise.
 
 ## Code guide
 
